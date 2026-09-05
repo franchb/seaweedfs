@@ -10,7 +10,7 @@ on:
       - 'weed/pb/volume_server_pb/**'
       - '.github/workflows/rust-volume-server-tests.yml'
   push:
-    branches: [ master, main ]
+    branches: [ master, main, fix-11179-redb-combined ]
     paths:
       - 'seaweed-volume/**'
       - 'test/volume_server/**'
@@ -37,7 +37,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
 
       # cargo tracks its own inputs but not the runner's C toolchain, so a cached
       # target/ can carry C objects built against a different glibc than we link against.
@@ -77,7 +79,9 @@ jobs:
           go-version-file: 'go.mod'
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
 
       # cargo tracks its own inputs but not the runner's C toolchain, so a cached
       # target/ can carry C objects built against a different glibc than we link against.
@@ -159,7 +163,9 @@ jobs:
           go-version-file: 'go.mod'
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
 
       # cargo tracks its own inputs but not the runner's C toolchain, so a cached
       # target/ can carry C objects built against a different glibc than we link against.

@@ -4,7 +4,7 @@ A drop-in replacement for the [SeaweedFS](https://github.com/seaweedfs/seaweedfs
 
 ## Building
 
-Requires Rust 1.75+ (2021 edition).
+Requires Rust 1.98.1 (2021 edition); `rust-toolchain.toml` selects it automatically with rustup.
 
 ```bash
 cd seaweed-volume

@@ -1,0 +1,4 @@
+# Default toolchain for the Rust volume server. rustup picks this up for
+# every cargo command run inside seaweed-volume, locally and in CI.
+[toolchain]
+channel = "1.98.1"

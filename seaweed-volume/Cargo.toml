@@ -2,6 +2,7 @@
 name = "weed-volume"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.98.1"
 description = "SeaweedFS Volume Server — Rust implementation"
 
 [lib]
