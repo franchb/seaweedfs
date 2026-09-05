@@ -455,8 +455,14 @@ impl RedbNeedleMap {
 
     /// Make the table durable and record how much of the .idx it reflects.
     /// Precondition: the .dat the index points into has been flushed.
-    pub fn checkpoint(&mut self) -> io::Result<()> {
-        let txn = self.begin_checkpoint()?;
+    ///
+    /// When `sync_idx` is true the .idx file is fsynced first — the recorded
+    /// size must never exceed what is on disk, or the reload would have to
+    /// rebuild from scratch. A caller that has already fsynced the .idx (e.g.
+    /// the volume's `flush_idx` on the fsync=true write path) may pass false
+    /// to avoid a redundant fsync.
+    pub fn checkpoint(&mut self, sync_idx: bool) -> io::Result<()> {
+        let txn = self.begin_checkpoint(sync_idx)?;
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)))?;
         self.writes_since_checkpoint = 0;
@@ -465,11 +471,12 @@ impl RedbNeedleMap {
 
     /// Begin a durable transaction (fsync on commit) that also records how
     /// much of the .idx the table reflects, so a reload replays only the
-    /// tail appended after it. The .idx is synced first: the recorded size
-    /// must never exceed what is on disk, or the reload would have to
-    /// rebuild from scratch.
-    fn begin_checkpoint(&self) -> io::Result<redb::WriteTransaction> {
-        self.sync()?;
+    /// tail appended after it. When `sync_idx` is true the .idx is fsynced
+    /// first (see [`checkpoint`](Self::checkpoint)).
+    fn begin_checkpoint(&self, sync_idx: bool) -> io::Result<redb::WriteTransaction> {
+        if sync_idx {
+            self.sync()?;
+        }
         let txn = self.db.begin_write().map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("redb begin_write: {}", e))
         })?;
@@ -913,7 +920,7 @@ impl RedbNeedleMap {
     /// the recorded .idx size instead of replaying entries the table
     /// already holds.
     pub fn close(&mut self) {
-        if let Err(e) = self.checkpoint() {
+        if let Err(e) = self.checkpoint(true) {
             tracing::warn!("redb checkpoint on close failed: {}", e);
         }
         self.idx_file = None;
@@ -1092,10 +1099,12 @@ impl NeedleMap {
     }
 
     /// Take the checkpoint `checkpoint_due` asked for. The caller must have
-    /// flushed the .dat first.
-    pub fn checkpoint(&mut self) -> io::Result<()> {
+    /// flushed the .dat first. Pass `sync_idx = false` when the .idx has
+    /// already been fsynced (e.g. by `flush_idx` on the fsync=true path) to
+    /// avoid a redundant fsync.
+    pub fn checkpoint(&mut self, sync_idx: bool) -> io::Result<()> {
         match self {
-            NeedleMap::Redb(nm) => nm.checkpoint(),
+            NeedleMap::Redb(nm) => nm.checkpoint(sync_idx),
             NeedleMap::InMemory(_) | NeedleMap::SortedFile(_) => Ok(()),
         }
     }
@@ -1743,7 +1752,7 @@ mod tests {
         assert!(nm.checkpoint_due());
         assert_eq!(durable_idx_size(&db_path), None, "put() must not commit durably");
 
-        nm.checkpoint().unwrap();
+        nm.checkpoint(true).unwrap();
         assert!(!nm.checkpoint_due());
         assert_eq!(
             durable_idx_size(&db_path),

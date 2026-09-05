@@ -1874,7 +1874,7 @@ impl Volume {
             self.last_modified_ts_seconds = n.last_modified;
         }
 
-        self.maybe_checkpoint_index();
+        self.maybe_checkpoint_index(fsync);
 
         // Return Size(n.DataSize) as the logical size, matching Go's doWriteRequest
         Ok((offset, Size(n.data_size as i32), false))
@@ -1885,7 +1885,11 @@ impl Volume {
     /// the bytes it points at loads read-only (see load()). A failed .dat
     /// flush therefore skips the checkpoint; the map keeps asking, so it is
     /// retried on the next write.
-    fn maybe_checkpoint_index(&mut self) {
+    ///
+    /// When `idx_already_synced` is true the .idx has already been fsynced by
+    /// `flush_idx` on the fsync=true write path, so the checkpoint skips its
+    /// own .idx fsync to avoid a redundant one.
+    fn maybe_checkpoint_index(&mut self, idx_already_synced: bool) {
         let due = self.nm.as_ref().is_some_and(|nm| nm.checkpoint_due());
         if !due {
             return;
@@ -1900,7 +1904,7 @@ impl Volume {
             return;
         }
         let checkpointed = match self.nm.as_mut() {
-            Some(nm) => nm.checkpoint(),
+            Some(nm) => nm.checkpoint(!idx_already_synced),
             None => Ok(()),
         };
         if let Err(e) = checkpointed {
@@ -2045,7 +2049,7 @@ impl Volume {
         if let Some(nm) = &mut self.nm {
             nm.delete(n.id, Offset::from_actual_offset(offset as i64))?;
         }
-        self.maybe_checkpoint_index();
+        self.maybe_checkpoint_index(false);
 
         Ok(size)
     }
