@@ -98,13 +98,13 @@ pub(super) fn metrics_from_idx<R: Read + Seek>(
         for i in (0..batch).rev() {
             let entry = &buf[i * NEEDLE_MAP_ENTRY_SIZE..(i + 1) * NEEDLE_MAP_ENTRY_SIZE];
             let (key, offset, size) = idx_entry_from_bytes(entry);
-            metric.maybe_set_max_file_key(key);
             metric.maybe_set_max_needle_end(offset, size, version);
             let superseded = seen.test_and_add(key.into());
             if offset.is_zero() || size.is_deleted() {
                 // Tombstone: reserves no bytes, only marks the key as seen.
                 continue;
             }
+            metric.maybe_set_max_file_key(key);
             metric.file_count.fetch_add(1, Ordering::Relaxed);
             metric
                 .file_byte_count
