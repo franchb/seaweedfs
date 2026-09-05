@@ -792,7 +792,7 @@ impl RedbNeedleMap {
         }
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)))?;
-        self.writes_since_checkpoint += 1;
+        self.writes_since_checkpoint = self.writes_since_checkpoint.saturating_add(1);
 
         self.metric.on_put(key, old.as_ref(), size);
         Ok(())
@@ -866,7 +866,7 @@ impl RedbNeedleMap {
                 txn.commit().map_err(|e| {
                     io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e))
                 })?;
-                self.writes_since_checkpoint += 1;
+                self.writes_since_checkpoint = self.writes_since_checkpoint.saturating_add(1);
 
                 // Only now is the tombstone in the table the metrics describe.
                 self.metric.on_delete(&old);
