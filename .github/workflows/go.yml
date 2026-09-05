@@ -2,7 +2,7 @@ name: "go: build binary"
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, fix-11179-redb-combined ]
     paths:
       - '**/*.go'
       - 'go.mod'
