@@ -1425,12 +1425,24 @@ impl VolumeServer for VolumeGrpcService {
                 let mut preallocate_size: i64 = 0;
                 if !has_remote_dat {
                     let grpc_addr = super::heartbeat::to_grpc_address(&state.master_url);
-                    match super::heartbeat::try_get_master_configuration(
-                        &grpc_addr,
-                        state.outgoing_grpc_tls.as_ref(),
-                    )
-                    .await
-                    {
+                    // Race the master-configuration RPC against the caller's
+                    // response channel: a stalled master (or a slow leader
+                    // election) would otherwise hold the task and its .note
+                    // past a departing caller, since the per-chunk checks in
+                    // copy_file_from_source are never reached.
+                    let config = tokio::select! {
+                        res = super::heartbeat::try_get_master_configuration(
+                            &grpc_addr,
+                            state.outgoing_grpc_tls.as_ref(),
+                        ) => res,
+                        _ = tx.closed() => {
+                            return Err(Status::cancelled(format!(
+                                "volume {} copy cancelled by caller",
+                                vid
+                            )));
+                        }
+                    };
+                    match config {
                         Ok(resp) => {
                             if resp.volume_preallocate {
                                 preallocate_size = resp.volume_size_limit_m_b as i64 * 1024 * 1024;
