@@ -1633,9 +1633,15 @@ impl VolumeServer for VolumeGrpcService {
                 // the .dat/.idx/.vif in one step; the remove_file calls below
                 // cover the never-mounted partial-file case and are harmless
                 // no-ops when delete_volume already removed the files.
+                //
+                // keep_remote_data=true matches the pre-spawn delete_volume at
+                // the top of volume_copy: a remote-tier copy's .vif points at
+                // the same cloud object the source replica references, so
+                // destroying the abandoned destination with keep_remote_data=
+                // false would delete the source's remote data.
                 if mounted {
                     let mut store = state.store.write().unwrap();
-                    let _ = store.delete_volume(vid, false, false);
+                    let _ = store.delete_volume(vid, false, true);
                     state.volume_state_notify.notify_one();
                 }
                 let _ = std::fs::remove_file(format!("{}.dat", data_base_name));
@@ -5098,16 +5104,34 @@ where
         ignore_source_file_not_found: ignore_source_not_found,
     };
 
-    let mut stream = client
-        .copy_file(copy_req)
-        .await
-        .map_err(|e| {
-            Status::internal(format!(
-                "failed to start copying volume {} {} file: {}",
-                volume_id, ext, e
-            ))
-        })?
-        .into_inner();
+    // Cancellation surfaces as Status::cancelled so the spawn's error branch
+    // can distinguish it from ordinary failures (logging + future handling).
+    // The other errors here stay Status::internal, matching the prior
+    // `.map_err(|e| Status::internal(e))` at the call sites.
+    let cancelled = || {
+        Status::cancelled(format!(
+            "volume {} {} copy cancelled by caller",
+            volume_id, ext
+        ))
+    };
+
+    // Race the initial RPC establishment against the caller's response channel:
+    // if the source stalls before sending response headers, the per-message
+    // select! below is never reached, and without this race the task, the
+    // source connection, and any preallocated files would outlive a caller
+    // that has already gone.
+    let mut stream = tokio::select! {
+        res = client.copy_file(copy_req) => {
+            res.map_err(|e| {
+                Status::internal(format!(
+                    "failed to start copying volume {} {} file: {}",
+                    volume_id, ext, e
+                ))
+            })?
+            .into_inner()
+        }
+        _ = progress_tx.closed() => return Err(cancelled()),
+    };
 
     let mut file = if is_append {
         std::fs::OpenOptions::new()
@@ -5126,16 +5150,6 @@ where
 
     let mut progressed_bytes: i64 = 0;
     let mut modified_ts_ns: i64 = 0;
-    // Cancellation surfaces as Status::cancelled so the spawn's error branch
-    // can distinguish it from ordinary failures (logging + future handling).
-    // The other errors here stay Status::internal, matching the prior
-    // `.map_err(|e| Status::internal(e))` at the call sites.
-    let cancelled = || {
-        Status::cancelled(format!(
-            "volume {} {} copy cancelled by caller",
-            volume_id, ext
-        ))
-    };
 
     // The source stream's message() future is the one await in this loop that
     // can hang indefinitely: a stalled source (slow disk, network partition,
