@@ -1396,6 +1396,11 @@ impl VolumeServer for VolumeGrpcService {
         let state = self.state.clone();
 
         tokio::spawn(async move {
+            // Tracks whether mount_volume succeeded so the error branch can
+            // unmount (not just unlink) an orphaned replica. A mount that
+            // races a departing caller is the one case where the existing
+            // file-only cleanup leaves the volume loaded in memory.
+            let mut mounted = false;
             let result = async {
                 // Nothing below is worth doing for a caller that has already
                 // gone: the transfer would spend the source's bandwidth and the
@@ -1576,16 +1581,29 @@ impl VolumeServer for VolumeGrpcService {
                         .map_err(|e| {
                             Status::internal(format!("failed to mount volume {}: {}", vid, e))
                         })?;
+                    mounted = true;
                 }
                 state.volume_state_notify.notify_one();
 
-                // Send final response with last_append_at_ns
-                let _ = tx
+                // Send final response with last_append_at_ns. A failed send
+                // means the caller is gone: the mount above raced a departing
+                // receiver (the pre-mount is_closed() check cannot close that
+                // window), and leaving the volume mounted is exactly the orphan
+                // this PR prevents. Surface it as Cancelled so the error branch
+                // unmounts and deletes the replica it just created.
+                if tx
                     .send(Ok(volume_server_pb::VolumeCopyResponse {
                         last_append_at_ns: last_append_at_ns,
                         processed_bytes: 0,
                     }))
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return Err(Status::cancelled(format!(
+                        "volume {} copy cancelled by caller after mount",
+                        vid
+                    )));
+                }
 
                 Ok::<(), Status>(())
             }
@@ -1610,7 +1628,16 @@ impl VolumeServer for VolumeGrpcService {
                         e
                     );
                 }
-                // Clean up on error
+                // Clean up on error. If the volume was mounted (the after-mount
+                // race), delete_volume unmounts it from the store AND removes
+                // the .dat/.idx/.vif in one step; the remove_file calls below
+                // cover the never-mounted partial-file case and are harmless
+                // no-ops when delete_volume already removed the files.
+                if mounted {
+                    let mut store = state.store.write().unwrap();
+                    let _ = store.delete_volume(vid, false, false);
+                    state.volume_state_notify.notify_one();
+                }
                 let _ = std::fs::remove_file(format!("{}.dat", data_base_name));
                 let _ = std::fs::remove_file(format!("{}.idx", idx_base_name));
                 let _ = std::fs::remove_file(format!("{}.vif", data_base_name));
@@ -5110,11 +5137,23 @@ where
         ))
     };
 
-    while let Some(resp) = stream
-        .message()
-        .await
-        .map_err(|e| Status::internal(format!("receiving {}: {}", dest_path, e)))?
-    {
+    // The source stream's message() future is the one await in this loop that
+    // can hang indefinitely: a stalled source (slow disk, network partition,
+    // GC pause on the source host) never returns a chunk, and without racing
+    // it against the caller's response channel the detached task, the source
+    // connection, and the partial files (including the .note) all outlive the
+    // caller. select! lets a departing caller preempt the source read.
+    loop {
+        let resp = tokio::select! {
+            msg = stream.message() => {
+                msg.map_err(|e| Status::internal(format!("receiving {}: {}", dest_path, e)))?
+            }
+            _ = progress_tx.closed() => return Err(cancelled()),
+        };
+        let resp = match resp {
+            Some(r) => r,
+            None => break,
+        };
         if resp.modified_ts_ns != 0 {
             modified_ts_ns = resp.modified_ts_ns;
         }
@@ -6129,6 +6168,67 @@ mod tests {
                 "destination mounted a volume whose copy was abandoned"
             );
         }
+
+        for ext in [".dat", ".idx", ".vif", ".note"] {
+            assert!(
+                !std::path::Path::new(&dest_file(ext)).exists(),
+                "abandoned copy left {} behind",
+                dest_file(ext)
+            );
+        }
+    }
+
+    // If the caller departs in the narrow window between the pre-mount
+    // is_closed() check and the final tx.send, the volume is already mounted
+    // when the send fails. The task must roll back that mount — not just unlink
+    // the files — or the destination carries the volume's index cache for the
+    // life of the process. This test uses a small volume with no throttle so the
+    // copy can complete and mount before the closed-channel check catches it;
+    // either cancellation path (pre-mount or after-mount) must leave the
+    // destination clean. Unlike the test above, we do not poll find_volume
+    // during the wait: the after-mount path momentarily mounts the volume, and
+    // a poll that lands in that window would false-positive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_volume_copy_after_mount_cancellation_rolls_back_mount() {
+        let (source_service, _source_tmp, _dat_bytes) = make_local_service_with_large_volume();
+        let (port, _shutdown) = serve_source(source_service).await;
+
+        let (dest_service, dest_tmp) = make_local_service_with_volume("", None);
+        {
+            let mut store = dest_service.state.store.write().unwrap();
+            store.delete_volume(VolumeId(1), false, false).unwrap();
+            for loc in &store.locations {
+                loc.check_disk_space();
+            }
+        }
+        let dest_dir = dest_tmp.path().to_str().unwrap().to_string();
+        let dest_file = |ext: &str| format!("{}/1{}", dest_dir, ext);
+
+        let response = dest_service
+            .volume_copy(Request::new(volume_server_pb::VolumeCopyRequest {
+                volume_id: 1,
+                collection: String::new(),
+                source_data_node: format!("127.0.0.1:1.{}", port),
+                disk_type: String::new(),
+                io_byte_per_second: 0,
+                replication: String::new(),
+                ttl: String::new(),
+            }))
+            .await
+            .unwrap();
+        drop(response);
+
+        // Wait long enough for either cancellation path to finish cleanup.
+        // The after-mount path momentarily mounts the volume; do not poll
+        // find_volume during this window.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let store = dest_service.state.store.read().unwrap();
+        assert!(
+            store.find_volume(VolumeId(1)).is_none(),
+            "destination still holds a mounted volume after after-mount cancellation"
+        );
+        drop(store);
 
         for ext in [".dat", ".idx", ".vif", ".note"] {
             assert!(
