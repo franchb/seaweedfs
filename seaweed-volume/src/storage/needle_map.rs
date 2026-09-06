@@ -768,10 +768,13 @@ impl RedbNeedleMap {
 
     /// Insert or update an entry. Writes to idx file first, then redb.
     pub fn put(&mut self, key: NeedleId, offset: Offset, size: Size) -> io::Result<()> {
-        // Persist to idx file BEFORE mutating redb state for crash consistency
+        // Persist to idx file BEFORE mutating redb state for crash consistency.
+        // The offset is advanced only after the redb commit succeeds: a failed
+        // commit leaves an orphan row in .idx that redb doesn't reflect, and
+        // advancing the offset here would let a later checkpoint record it as
+        // reflected, making the reload skip it permanently.
         if let Some(ref mut idx_file) = self.idx_file {
             idx::write_index_entry(idx_file, key, offset, size)?;
-            self.idx_file_offset += NEEDLE_MAP_ENTRY_SIZE as u64;
         }
 
         let key_u64: u64 = key.into();
@@ -792,6 +795,9 @@ impl RedbNeedleMap {
         }
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)))?;
+        if self.idx_file.is_some() {
+            self.idx_file_offset += NEEDLE_MAP_ENTRY_SIZE as u64;
+        }
         self.writes_since_checkpoint = self.writes_since_checkpoint.saturating_add(1);
 
         self.metric.on_put(key, old.as_ref(), size);
@@ -840,10 +846,11 @@ impl RedbNeedleMap {
 
         if let Some(old) = self.get_internal(key_u64)? {
             if old.size.is_valid() {
-                // Persist tombstone to idx file BEFORE mutating redb
+                // Persist tombstone to idx file BEFORE mutating redb. The
+                // offset is advanced only after the redb commit succeeds
+                // (see put).
                 if let Some(ref mut idx_file) = self.idx_file {
                     idx::write_index_entry(idx_file, key, offset, TOMBSTONE_FILE_SIZE)?;
-                    self.idx_file_offset += NEEDLE_MAP_ENTRY_SIZE as u64;
                 }
 
                 let deleted_size = Size(-(old.size.0));
@@ -866,6 +873,9 @@ impl RedbNeedleMap {
                 txn.commit().map_err(|e| {
                     io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e))
                 })?;
+                if self.idx_file.is_some() {
+                    self.idx_file_offset += NEEDLE_MAP_ENTRY_SIZE as u64;
+                }
                 self.writes_since_checkpoint = self.writes_since_checkpoint.saturating_add(1);
 
                 // Only now is the tombstone in the table the metrics describe.
