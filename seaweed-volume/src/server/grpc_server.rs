@@ -1470,8 +1470,7 @@ impl VolumeServer for VolumeGrpcService {
                         report_interval,
                         &mut throttler,
                     )
-                    .await
-                    .map_err(|e| Status::internal(e))?;
+                    .await?;
                     if dat_modified_ts_ns > 0 {
                         let _ = set_file_mtime(&dat_path, dat_modified_ts_ns);
                     }
@@ -1496,8 +1495,7 @@ impl VolumeServer for VolumeGrpcService {
                     report_interval,
                     &mut throttler,
                 )
-                .await
-                .map_err(|e| Status::internal(e))?;
+                .await?;
                 if idx_modified_ts_ns > 0 {
                     let _ = set_file_mtime(&idx_path, idx_modified_ts_ns);
                 }
@@ -1521,8 +1519,7 @@ impl VolumeServer for VolumeGrpcService {
                     report_interval,
                     &mut throttler,
                 )
-                .await
-                .map_err(|e| Status::internal(e))?;
+                .await?;
                 if vif_modified_ts_ns > 0 {
                     let _ = set_file_mtime(&vif_path, vif_modified_ts_ns);
                 }
@@ -5057,7 +5054,7 @@ async fn copy_file_from_source<T>(
     next_report_target: &mut i64,
     report_interval: i64,
     throttler: &mut WriteThrottler,
-) -> Result<i64, String>
+) -> Result<i64, Status>
 where
     T: tonic::client::GrpcService<tonic::body::BoxBody>,
     T::Error: Into<tonic::codegen::StdError>,
@@ -5078,10 +5075,10 @@ where
         .copy_file(copy_req)
         .await
         .map_err(|e| {
-            format!(
+            Status::internal(format!(
                 "failed to start copying volume {} {} file: {}",
                 volume_id, ext, e
-            )
+            ))
         })?
         .into_inner();
 
@@ -5090,24 +5087,33 @@ where
             .create(true)
             .append(true)
             .open(dest_path)
-            .map_err(|e| format!("open file {}: {}", dest_path, e))?
+            .map_err(|e| Status::internal(format!("open file {}: {}", dest_path, e)))?
     } else {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(dest_path)
-            .map_err(|e| format!("open file {}: {}", dest_path, e))?
+            .map_err(|e| Status::internal(format!("open file {}: {}", dest_path, e)))?
     };
 
     let mut progressed_bytes: i64 = 0;
     let mut modified_ts_ns: i64 = 0;
-    let cancelled = || format!("volume {} {} copy cancelled by caller", volume_id, ext);
+    // Cancellation surfaces as Status::cancelled so the spawn's error branch
+    // can distinguish it from ordinary failures (logging + future handling).
+    // The other errors here stay Status::internal, matching the prior
+    // `.map_err(|e| Status::internal(e))` at the call sites.
+    let cancelled = || {
+        Status::cancelled(format!(
+            "volume {} {} copy cancelled by caller",
+            volume_id, ext
+        ))
+    };
 
     while let Some(resp) = stream
         .message()
         .await
-        .map_err(|e| format!("receiving {}: {}", dest_path, e))?
+        .map_err(|e| Status::internal(format!("receiving {}: {}", dest_path, e)))?
     {
         if resp.modified_ts_ns != 0 {
             modified_ts_ns = resp.modified_ts_ns;
@@ -5123,7 +5129,7 @@ where
             }
             use std::io::Write;
             file.write_all(&resp.file_content)
-                .map_err(|e| format!("write file {}: {}", dest_path, e))?;
+                .map_err(|e| Status::internal(format!("write file {}: {}", dest_path, e)))?;
             progressed_bytes += resp.file_content.len() as i64;
             // A throttled copy sleeps seconds at a time; wake for a departing
             // caller instead of finishing the nap first.
@@ -6043,8 +6049,18 @@ mod tests {
         )
         .await
         .expect_err("a copy whose caller is gone must not run to completion");
+        // Cancellation must surface as Status::cancelled, not Status::internal:
+        // the spawn's error branch classifies on the code, so an Internal here
+        // would be logged as a generic failure instead of "abandoned by caller".
+        assert_eq!(
+            err.code(),
+            tonic::Code::Cancelled,
+            "expected Cancelled, got {:?}: {}",
+            err.code(),
+            err
+        );
         assert!(
-            err.contains("cancelled by caller"),
+            err.message().contains("cancelled by caller"),
             "unexpected error: {}",
             err
         );
