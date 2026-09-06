@@ -184,11 +184,18 @@ impl NeedleMapKind {
 /// Trait for appending to an index file.
 pub trait IdxFileWriter: Write + Send + Sync {
     fn sync_all(&self) -> io::Result<()>;
+    /// Truncate the file to `len` bytes. Used to remove an orphan .idx row
+    /// left by a failed redb commit so `idx_file_offset` stays a contiguous
+    /// replay watermark.
+    fn truncate_to(&mut self, len: u64) -> io::Result<()>;
 }
 
 impl IdxFileWriter for std::fs::File {
     fn sync_all(&self) -> io::Result<()> {
         std::fs::File::sync_all(self)
+    }
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
     }
 }
 
@@ -793,8 +800,10 @@ impl RedbNeedleMap {
                 .insert(key_u64, packed.as_slice())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb insert: {}", e)))?;
         }
-        txn.commit()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)))?;
+        if let Err(e) = txn.commit() {
+            self.truncate_idx_to_offset();
+            return Err(io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)));
+        }
         if self.idx_file.is_some() {
             self.idx_file_offset += NEEDLE_MAP_ENTRY_SIZE as u64;
         }
@@ -870,9 +879,10 @@ impl RedbNeedleMap {
                         io::Error::new(io::ErrorKind::Other, format!("redb insert: {}", e))
                     })?;
                 }
-                txn.commit().map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e))
-                })?;
+                if let Err(e) = txn.commit() {
+                    self.truncate_idx_to_offset();
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)));
+                }
                 if self.idx_file.is_some() {
                     self.idx_file_offset += NEEDLE_MAP_ENTRY_SIZE as u64;
                 }
@@ -924,6 +934,18 @@ impl RedbNeedleMap {
             idx_file.sync_all()?;
         }
         Ok(())
+    }
+
+    /// Remove any .idx bytes past `idx_file_offset` — the orphan row left by
+    /// a failed redb commit. Without this the next successful write appends
+    /// after the orphan, `idx_file_offset` advances past it, and a later
+    /// checkpoint records an offset that makes the reload skip the orphan.
+    fn truncate_idx_to_offset(&mut self) {
+        if let Some(ref mut idx_file) = self.idx_file {
+            if let Err(e) = idx_file.truncate_to(self.idx_file_offset) {
+                tracing::warn!("failed to truncate orphan .idx row: {}", e);
+            }
+        }
     }
 
     /// Close the index file, checkpointing first so a reload starts from
