@@ -936,6 +936,19 @@ impl RedbNeedleMap {
         self.idx_file = None;
     }
 
+    /// Sync the .idx and drop the writer without taking a durable checkpoint.
+    /// Used when the .dat flush failed: a checkpoint would make the index
+    /// durable with entries that may point past the unflushed .dat tail, so
+    /// the reload's max_needle_end check would mark the volume read-only.
+    /// Without the checkpoint, META_IDX_SIZE stays at the last successful one
+    /// and the reload replays the uncheckpointed tail (redb flushes on drop).
+    pub fn close_without_checkpoint(&mut self) {
+        if let Err(e) = self.sync() {
+            tracing::warn!("redb idx sync on close failed: {}", e);
+        }
+        self.idx_file = None;
+    }
+
     /// Save the redb contents to an index file, sorted by needle ID ascending.
     pub fn save_to_idx(&self, path: &str) -> io::Result<()> {
         let txn = self
@@ -1198,6 +1211,16 @@ impl NeedleMap {
         match self {
             NeedleMap::InMemory(nm) => nm.close(),
             NeedleMap::Redb(nm) => nm.close(),
+            NeedleMap::SortedFile(nm) => nm.close(),
+        }
+    }
+
+    /// Close without checkpointing — sync the .idx and drop the writer only.
+    /// See [`RedbNeedleMap::close_without_checkpoint`].
+    pub fn close_without_checkpoint(&mut self) {
+        match self {
+            NeedleMap::InMemory(nm) => nm.close(),
+            NeedleMap::Redb(nm) => nm.close_without_checkpoint(),
             NeedleMap::SortedFile(nm) => nm.close(),
         }
     }

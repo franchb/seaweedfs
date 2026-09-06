@@ -4003,15 +4003,29 @@ impl Volume {
     }
 
     pub fn close(&mut self) {
-        if let Some(ref dat_file) = self.dat_file {
-            let _ = dat_file.sync_all();
-        }
+        let dat_synced = if let Some(ref dat_file) = self.dat_file {
+            dat_file.sync_all().is_ok()
+        } else {
+            true
+        };
         self.dat_file = None;
         self.remote_dat_file = None;
-        // close() syncs the .idx and, for redb, checkpoints the table so the
-        // next load starts from the recorded .idx size instead of replaying.
+        // When the .dat flushed, checkpoint the index so the next load starts
+        // from the recorded .idx size. When it did not, skip the checkpoint:
+        // a durable index pointing past an unflushed .dat tail would make the
+        // reload's max_needle_end check mark the volume read-only. Without the
+        // checkpoint, META_IDX_SIZE stays at the last successful one and the
+        // reload replays the uncheckpointed tail (redb flushes on drop).
         if let Some(ref mut nm) = self.nm {
-            nm.close();
+            if dat_synced {
+                nm.close();
+            } else {
+                tracing::warn!(
+                    "volume {}: .dat sync failed on close, skipping index checkpoint",
+                    self.id.0
+                );
+                nm.close_without_checkpoint();
+            }
         }
         self.nm = None;
     }
