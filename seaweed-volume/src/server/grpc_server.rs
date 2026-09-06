@@ -6208,12 +6208,19 @@ mod tests {
     // is_closed() check and the final tx.send, the volume is already mounted
     // when the send fails. The task must roll back that mount — not just unlink
     // the files — or the destination carries the volume's index cache for the
-    // life of the process. This test uses a small volume with no throttle so the
-    // copy can complete and mount before the closed-channel check catches it;
-    // either cancellation path (pre-mount or after-mount) must leave the
-    // destination clean. Unlike the test above, we do not poll find_volume
-    // during the wait: the after-mount path momentarily mounts the volume, and
-    // a poll that lands in that window would false-positive.
+    // life of the process.
+    //
+    // Reaching that window black-box needs a seam. The one the code already
+    // offers is the store write lock: the test takes it immediately after
+    // volume_copy returns, so the spawned task runs the copy to completion with
+    // the caller still attached, passes the pre-mount is_closed() check, then
+    // parks entering the mount block (state.store.write() blocks on the test's
+    // guard). The test then drops the response — the caller is gone — and
+    // releases the guard. The task acquires the lock, mounts, fails the final
+    // tx.send (receiver dropped), and must roll back via the error branch's
+    // delete_volume. Without the lock seam the task sees is_closed() at its
+    // very first check and returns before mount_volume, exercising the wrong
+    // path — the test would be green for the wrong reason.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_volume_copy_after_mount_cancellation_rolls_back_mount() {
         let (source_service, _source_tmp, _dat_bytes) = make_local_service_with_large_volume();
@@ -6242,12 +6249,25 @@ mod tests {
             }))
             .await
             .unwrap();
+
+        // Hold the store write lock so the task parks at the mount block after
+        // completing the copy and passing the pre-mount is_closed() check.
+        let store_guard = dest_service.state.store.write().unwrap();
+
+        // Give the copy time to complete and the task to reach the mount block.
+        // The 5 MB fixture copies in well under a second on a local loopback
+        // gRPC connection; 2 s is generous and keeps the test fast.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // The caller hangs up while the task is parked at the mount block.
         drop(response);
 
-        // Wait long enough for either cancellation path to finish cleanup.
-        // The after-mount path momentarily mounts the volume; do not poll
-        // find_volume during this window.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Release the store lock so the task can enter the mount block, mount,
+        // fail the final send, and roll back.
+        drop(store_guard);
+
+        // Wait for the rollback to finish.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let store = dest_service.state.store.read().unwrap();
         assert!(
