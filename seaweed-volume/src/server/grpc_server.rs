@@ -4459,42 +4459,40 @@ impl VolumeServer for VolumeGrpcService {
             }
         };
 
-        {
-            for vid in &vids {
-                // Re-resolve under a fresh guard each iteration; the volume set can
-                // legitimately change between volumes now that the lock is released.
-                let (scrub_result, file_count) = {
-                    let store = self.state.store.read().unwrap();
-                    let (_, v) = store
-                        .find_volume(*vid)
-                        .ok_or_else(|| Status::not_found(format!("volume id {} not found", vid.0)))?;
+        for vid in &vids {
+            // Re-resolve under a fresh guard each iteration; the volume set can
+            // legitimately change between volumes now that the lock is released.
+            let (scrub_result, file_count) = {
+                let store = self.state.store.read().unwrap();
+                let (_, v) = store
+                    .find_volume(*vid)
+                    .ok_or_else(|| Status::not_found(format!("volume id {} not found", vid.0)))?;
 
-                    // INDEX mode (1) calls scrub_index; FULL (2) and LOCAL (3) call scrub
-                    let r = if mode == 1 { v.scrub_index() } else { v.scrub() };
-                    (r, v.file_count())
-                };
-                total_volumes += 1;
+                // INDEX mode (1) calls scrub_index; FULL (2) and LOCAL (3) call scrub
+                let r = if mode == 1 { v.scrub_index() } else { v.scrub() };
+                (r, v.file_count())
+            };
+            total_volumes += 1;
 
-                match scrub_result {
-                    Ok((files, broken)) => {
-                        total_files += files;
-                        if !broken.is_empty() {
-                            broken_vids.push(*vid);
-                            broken_volume_ids.push(vid.0);
-                            for msg in broken {
-                                details.push(format!("vol {}: {}", vid.0, msg));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        total_files += file_count.max(0) as u64;
+            match scrub_result {
+                Ok((files, broken)) => {
+                    total_files += files;
+                    if !broken.is_empty() {
                         broken_vids.push(*vid);
                         broken_volume_ids.push(vid.0);
-                        details.push(format!("vol {}: scrub error: {}", vid.0, e));
+                        for msg in broken {
+                            details.push(format!("vol {}: {}", vid.0, msg));
+                        }
                     }
                 }
+                Err(e) => {
+                    total_files += file_count.max(0) as u64;
+                    broken_vids.push(*vid);
+                    broken_volume_ids.push(vid.0);
+                    details.push(format!("vol {}: scrub error: {}", vid.0, e));
+                }
             }
-        } // store lock dropped here
+        }
 
         // Match Go: if mark_broken_volumes_readonly, call makeVolumeReadonly on each broken volume.
         // Collect errors via errors.Join semantics (return joined error if any fail).
@@ -4581,8 +4579,8 @@ impl VolumeServer for VolumeGrpcService {
             match mode {
                 1 => {
                     // INDEX mode: check ecx index integrity only, no shard verification.
-                    // Same shape as the CHECKSUM arm below: snapshot cheaply,
-                    // release the store lock, then walk the index.
+                    // Same shape as the CHECKSUM arm below: snapshot, release
+                    // the store lock, then walk the index.
                     let plan = {
                         let store = self.state.store.read().unwrap();
                         let ecv = store.find_ec_volume(vid).ok_or_else(|| {
@@ -4711,14 +4709,8 @@ impl VolumeServer for VolumeGrpcService {
                     // bitrot checksum sidecar, exercising cold parity shards.
                     // Read-only. Mirrors Go's v.ChecksumScrub().
                     // Snapshot under a brief lock, then verify with the lock
-                    // RELEASED. checksum_scrub reads every byte of every local
-                    // shard; running that under the store read guard parks the
-                    // periodic heartbeat's store.write(), and because
-                    // std::sync::RwLock is write-preferring every later reader —
-                    // i.e. every HTTP handler — queues behind that pending
-                    // writer. The node then serves nothing, stops heart-beating,
-                    // and cannot answer this RPC's own keepalive, so the scrub
-                    // kills the connection it is running on.
+                    // RELEASED: this reads every byte of every local shard, which
+                    // under the guard stalls the node. See EcChecksumScrubPlan.
                     let (plan, collection) = {
                         let store = self.state.store.read().unwrap();
                         let ecv = store.find_ec_volume(vid).ok_or_else(|| {

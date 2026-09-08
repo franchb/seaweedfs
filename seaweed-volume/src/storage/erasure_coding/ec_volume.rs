@@ -621,56 +621,20 @@ impl EcVolume {
     /// raising false shard-corruption alarms.
     ///
     /// This method NEVER deletes or mutates anything — it is purely diagnostic.
-    /// Everything `checksum_scrub` needs, captured WITHOUT doing any I/O.
-    ///
-    /// This exists so the verification can run with the store lock released.
-    /// `checksum_scrub` reads every byte of every local shard; done under the
-    /// caller's `store.read()` guard it parks the periodic heartbeat's
-    /// `store.write()` for the whole scan, and because `std::sync::RwLock` is
-    /// write-preferring every later reader — i.e. every HTTP handler — queues
-    /// behind that pending writer. The server then serves nothing, stops
-    /// heart-beating, and cannot answer the scrub's own gRPC keepalive, so the
-    /// scrub kills the connection it is running on. Measured on a 4.46 cluster:
-    /// `collect_heartbeat_with_snapshot` blocked 27.97s of a 30s window, and a
-    /// `/status` request issued mid-scrub returned 200 only after waiting 120s.
-    ///
-    /// Every field here is owned, so the guard can be dropped before `run()`.
-    ///
-    /// The local shards are OPENED here, under the guard, and `run()` reads
-    /// through those handles. Resolving the path again during the scan would
-    /// let a teardown that legitimately unlinks the shards — the heartbeat's
-    /// `delete_expired_ec_volumes`, or `volume_ec_shards_delete` — turn an
-    /// intentional removal into a "scrub read error" and report the volume
-    /// broken; the store read guard used to serialize the scan against those
-    /// writers, and it no longer does. An open fd survives the unlink, which is
-    /// also how Go reads: `ChecksumScrub` goes through `shard.ReadAt`, never
-    /// through a path.
+    /// Duplicates the mounted shard handles so `run()` can scan with the store
+    /// guard released; see `EcChecksumScrubPlan` for why that matters.
     pub fn checksum_scrub_plan(&self) -> EcChecksumScrubPlan {
         let (prot, status) = self.bitrot_protection();
 
         // Only BitrotOn reaches the shard loop in `run()`; the other statuses
-        // return before touching a handle, so opening for them buys nothing.
-        let shards = match (&prot, status) {
-            (Some(p), crate::storage::erasure_coding::ec_bitrot::BitrotStatus::On) => {
-                let base = self.base_name();
-                let generation = p.generation;
-                self.shards
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, slot)| slot.is_some())
-                    .map(|(i, _)| {
-                        let shard_id = i as u32;
-                        // Mirrors EcVolumeShard::reopen_against_generation's
-                        // naming convention.
-                        let path = if generation == 0 {
-                            format!("{}.ec{:02}", base, shard_id)
-                        } else {
-                            format!("{}.ec{:02}.v{}", base, shard_id, generation)
-                        };
-                        (shard_id, File::open(&path))
-                    })
-                    .collect()
-            }
+        // return before touching a handle, so cloning for them buys nothing.
+        let shards = match status {
+            crate::storage::erasure_coding::ec_bitrot::BitrotStatus::On => self
+                .shards
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| slot.as_ref().map(|s| (i as u32, s.try_clone_file())))
+                .collect(),
             _ => Vec::new(),
         };
 
@@ -1242,16 +1206,14 @@ impl EcVolume {
     /// ScrubIndex verifies index integrity of an EC volume.
     /// Matches Go's `(ev *EcVolume) ScrubIndex()` → `idx.CheckIndexFile()`.
     /// Returns (entry_count, errors).
-    /// Snapshot for `scrub_index`, captured without I/O so the index walk can
-    /// run with the store lock released. Same rationale as
-    /// `checksum_scrub_plan` — see its comment.
+    /// Snapshot for `scrub_index`, so the index walk can run with the store
+    /// lock released. Same rationale as `checksum_scrub_plan`.
     pub fn scrub_index_plan(&self) -> EcIndexScrubPlan {
         let ecx_path = self.ecx_file_name();
-        // Opened here, under the guard, for the same reason the checksum plan
-        // captures its shard handles: a teardown between plan and run must not
-        // turn an intentional removal into an index-scrub error. A fresh open
-        // (not a try_clone of the cached handle) keeps the private cursor the
-        // structural walk needs.
+        // Opened under the guard, for the same reason the checksum plan
+        // duplicates its shard handles. A fresh open rather than a clone of the
+        // cached handle: `check_index_file` seeks, and `dup` would share the
+        // cursor the shared handle is read from elsewhere.
         let ecx_handle = File::open(&ecx_path);
         EcIndexScrubPlan {
             volume_id: self.volume_id,
@@ -1925,18 +1887,8 @@ mod tests {
         assert_eq!(prot.unwrap().shards.len(), 14);
     }
 
-    /// REGRESSION: the scrub plans must be SELF-CONTAINED, so the gRPC handler can
-    /// drop the store lock before the scan runs.
-    ///
-    /// `checksum_scrub` reads every byte of every local shard. Running that under
-    /// the caller's `store.read()` guard parked the periodic heartbeat's
-    /// `store.write()`, and because `std::sync::RwLock` is write-preferring, every
-    /// later reader — i.e. every HTTP handler — queued behind that pending writer.
-    /// The node served nothing, stopped heart-beating, and could not answer the
-    /// scrub RPC's own keepalive, so the scrub killed the connection it ran on.
-    /// Measured on a live 4.46 node: `collect_heartbeat_with_snapshot` blocked
-    /// 27.97s of a 30s window, and a `/status` request issued mid-scrub returned
-    /// 200 only after waiting 120s.
+    /// REGRESSION: the scrub plans must be SELF-CONTAINED, so the handler can
+    /// drop the store lock before the scan runs — see `EcChecksumScrubPlan`.
     ///
     /// The volume is DROPPED before the plans run, and the plans are moved to
     /// another thread. A plan that borrowed from `EcVolume` could do neither, so
@@ -2012,19 +1964,12 @@ mod tests {
     }
 
     /// REGRESSION: a scrub running with the store lock RELEASED must not turn a
-    /// concurrent, intentional removal into a corruption report.
+    /// concurrent, intentional removal into a corruption report — see
+    /// `EcChecksumScrubPlan`.
     ///
-    /// The scan no longer runs under `store.read()`, so a store writer —
-    /// the heartbeat's `delete_expired_ec_volumes`, or `volume_ec_shards_delete`
-    /// — can unmount an EC volume and unlink its files while the scan is in
-    /// flight. Re-resolving the path at read time would surface that as
-    /// "scrub read error" and put the volume in `broken_volume_ids`. The plans
-    /// therefore capture open handles under the guard, which is also how Go
-    /// reads (`ChecksumScrub` -> `shard.ReadAt`, never a path).
-    ///
-    /// Deleting every file after the plans are built is the whole test: with
-    /// path-based reads the results diverge from the direct call, with captured
-    /// handles they are identical.
+    /// Deleting every file after the plans are built is the whole test: reads
+    /// that resolve a path diverge from the direct call, reads through the
+    /// captured descriptors are identical.
     #[test]
     fn test_scrub_plans_survive_files_removed_after_snapshot() {
         use crate::storage::needle_map::NeedleMapKind;
@@ -2918,21 +2863,32 @@ mod uniform_layout_tests {
     }
 }
 
-/// Self-contained input for an EC checksum scrub, snapshotted from an
-/// `EcVolume` under a brief lock so the scan itself needs no store access.
+/// Self-contained input for an EC checksum scrub: the sidecar plus a duplicate
+/// of every mounted local shard handle, taken under the store read guard.
 ///
-/// Not `Clone`: it owns the shard handles, and duplicating them would defeat
-/// the point of capturing exactly the files that were mounted under the guard.
+/// Two things follow from holding descriptors rather than paths. `run()` needs
+/// no store access, so the guard is released before a scan that reads every
+/// byte of every local shard — under the guard that scan parks the periodic
+/// heartbeat's `store.write()`, and `std::sync::RwLock` is write-preferring, so
+/// every later reader queues behind it and the node stops serving. And a
+/// teardown that legitimately unlinks the shards mid-scan (the heartbeat's
+/// `delete_expired_ec_volumes`, `volume_ec_shards_delete`) cannot masquerade as
+/// bitrot, because the descriptor outlives the name. Go reads the same way:
+/// `ChecksumScrub` goes through `shard.ReadAt`.
+///
+/// Not `Clone`: it owns those descriptors.
 #[derive(Debug)]
 pub struct EcChecksumScrubPlan {
     pub volume_id: VolumeId,
     pub prot: Option<crate::pb::volume_server_pb::EcBitrotProtection>,
     pub status: crate::storage::erasure_coding::ec_bitrot::BitrotStatus,
     pub parity_shards: u32,
-    /// One entry per LOCAL shard: its id and the handle opened while the store
-    /// lock was held (or the open error to report). Private so the plan can
-    /// only be built by `EcVolume::checksum_scrub_plan`, which is what makes
-    /// "opened under the guard" an invariant rather than a convention.
+    /// One entry per LOCAL shard: its id and a duplicate of the mounted
+    /// handle (or the error to report). Private so the plan can only be built
+    /// by `EcVolume::checksum_scrub_plan`, which is what makes "captured under
+    /// the guard" an invariant rather than a convention.
+    ///
+    /// `dup` shares the kernel file offset, so every read here is positional.
     shards: Vec<(u32, std::io::Result<File>)>,
 }
 
