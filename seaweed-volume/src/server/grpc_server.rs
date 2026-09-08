@@ -624,15 +624,25 @@ impl VolumeGrpcService {
                 }
                 3 => {
                     // LOCAL: verify each needle against the locally-held shards.
-                    let Some((files, shard_infos, errs)) = ({
+                    // Snapshot under a brief lock, then walk with the lock
+                    // RELEASED: this reads every local needle's bytes, which
+                    // under the guard stalls the node. See EcChecksumScrubPlan.
+                    let Some(plan) = ({
                         let store = self.state.store.read().unwrap();
-                        store.find_ec_volume(vid).map(|ecv| ecv.scrub_local())
+                        store.find_ec_volume(vid).map(|ecv| ecv.scrub_local_plan())
                     }) else {
                         if let Some(status) = scrub_vanished_volume(explicit, "EC volume", vid) {
                             return Err(status);
                         }
                         continue;
                     };
+                    // Synchronous CPU + file I/O: keep it off the async workers.
+                    let (files, shard_infos, errs) =
+                        tokio::task::spawn_blocking(move || plan.run())
+                            .await
+                            .map_err(|e| {
+                                Status::internal(format!("local scrub task failed: {}", e))
+                            })?;
                     total_volumes += 1;
                     total_files += files;
                     if !errs.is_empty() || !shard_infos.is_empty() {
