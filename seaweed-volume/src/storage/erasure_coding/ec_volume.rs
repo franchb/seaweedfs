@@ -1867,6 +1867,94 @@ mod tests {
         );
     }
 
+    /// REGRESSION: a malformed `.ecx` row must not abort the scrub TASK.
+    ///
+    /// `EcLocalScrubPlan::run()` skips only the -1 tombstone, matching Go's
+    /// `ScrubLocal`, so any OTHER negative size reaches the reassembly buffer
+    /// with a negative `get_actual_size()`. Go pays nothing for that (it
+    /// appends to a nil slice); Rust sizes a per-needle `Vec` from it, and
+    /// `Vec::with_capacity(negative as usize)` aborts the process. Now that the
+    /// plan runs under `spawn_blocking`, that abort comes back as a JoinError
+    /// and would take the whole node-wide scrub RPC down with every result
+    /// already collected. The row must be REPORTED, as Go reports it.
+    #[test]
+    fn test_local_scrub_plan_reports_negative_size_ecx_row() {
+        use crate::storage::needle_map::NeedleMapKind;
+        use crate::storage::volume::Volume;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        for i in 1..=8 {
+            let data = format!("test data for needle {} with a bit more length", i);
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: data.as_bytes().to_vec(),
+                data_size: data.len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        v.sync_to_disk().unwrap();
+        v.close();
+        crate::storage::erasure_coding::ec_encoder::write_ec_files(dir, dir, "", VolumeId(1), 10, 4)
+            .unwrap();
+
+        // Rewrite the first .ecx row's size as -1000: a negative that is NOT
+        // the -1 tombstone the walk skips. A scrub is what you point at an
+        // index you already suspect, so an arbitrary i32 in the size field is
+        // in-scope input, whatever wrote it.
+        let ecx = format!(
+            "{}.ecx",
+            crate::storage::volume::volume_file_name(dir, "", VolumeId(1))
+        );
+        let mut raw = std::fs::read(&ecx).unwrap();
+        assert!(
+            raw.len() >= NEEDLE_MAP_ENTRY_SIZE,
+            "fixture must write at least one .ecx row"
+        );
+        let (key, offset, _) = idx_entry_from_bytes(&raw[..NEEDLE_MAP_ENTRY_SIZE]);
+        idx_entry_to_bytes(&mut raw[..NEEDLE_MAP_ENTRY_SIZE], key, offset, Size(-1000));
+        std::fs::write(&ecx, &raw).unwrap();
+        assert!(
+            get_actual_size(Size(-1000), Version::current()) < 0,
+            "precondition: the row must drive get_actual_size negative"
+        );
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(1)).unwrap();
+        for id in 0..14u8 {
+            vol.add_shard(EcVolumeShard::new(dir, "", VolumeId(1), id))
+                .unwrap();
+        }
+        let plan = vol.scrub_local_plan();
+        drop(vol);
+
+        // The join IS the assertion: a panic here is the JoinError that used to
+        // fail the whole ScrubEcVolume RPC.
+        let (_count, _broken, errs) = std::thread::spawn(move || plan.run())
+            .join()
+            .expect("a malformed .ecx row must not abort the scrub task");
+
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(&format!("bytes for needle {}", key.0))),
+            "the malformed row must be reported, got {:?}",
+            errs
+        );
+    }
+
     /// REGRESSION: a scrub running with the store lock RELEASED must not turn a
     /// concurrent, intentional removal into a corruption report — see
     /// `EcChecksumScrubPlan`.
@@ -3058,9 +3146,14 @@ impl EcLocalScrubPlan {
                 return Ok(());
             }
 
+            // Go recomputes this at the size check below; hoisted because Rust
+            // also sizes the reassembly buffer from it. Any negative size other
+            // than the -1 tombstone skipped above drives it negative.
+            let want = get_actual_size(size, version);
+
             let locations = ec_locate::locate_data(
                 offset.to_actual_offset(),
-                Size(get_actual_size(size, version) as i32),
+                Size(want as i32),
                 shard_size,
                 data_shards,
                 large_block_size,
@@ -3074,10 +3167,18 @@ impl EcLocalScrubPlan {
                 shards.get(sid as usize).and_then(|s| s.as_ref()).is_none()
             });
             let mut read: i64 = 0;
-            let mut data: Vec<u8> = if has_remote_chunks {
+            // `want <= 0` means the row is malformed. Go pays nothing for it:
+            // it appends to a nil slice and has no capacity hint here. Rust's
+            // per-needle buffer does, and `Vec::with_capacity(negative as usize)`
+            // aborts the process -- inside spawn_blocking that surfaces as a
+            // JoinError and takes the whole node-wide scrub RPC with it. Fall
+            // through with an empty buffer instead: locate_data already returns
+            // no intervals for a non-positive size, so read stays 0 and the
+            // `read != want` check below reports the row, exactly as Go does.
+            let mut data: Vec<u8> = if has_remote_chunks || want <= 0 {
                 Vec::new()
             } else {
-                Vec::with_capacity(get_actual_size(size, version) as usize)
+                Vec::with_capacity(want as usize)
             };
             let mut local_shard_ids: Vec<ShardId> = Vec::new();
 
@@ -3147,7 +3248,6 @@ impl EcLocalScrubPlan {
 
             local_shard_ids.sort_unstable();
 
-            let want = get_actual_size(size, version);
             if read != want {
                 // Like Go, returning from the walk callback aborts the scan.
                 return Err(io::Error::new(

@@ -76,6 +76,47 @@ fn scrub_vanished_volume(explicit: bool, kind: &str, vid: VolumeId) -> Option<St
     None
 }
 
+/// How a scrub reacts to a `spawn_blocking` scan that failed to join.
+///
+/// The scan runs on the blocking pool, so a panic in it reaches the loop as a
+/// `JoinError` instead of unwinding here. Propagating it would discard every
+/// volume already scanned AND skip `emit_scrub_metrics`: a panic scrubbing one
+/// volume would hide real corruption found on the others and leave the
+/// staleness alert firing with nothing recorded to explain it. Record it
+/// against this volume and let the loop finish, the same way `scrub_volumes`
+/// treats a per-volume scrub error.
+///
+/// A panic is evidence about the volume, so it counts as broken. A join error
+/// from runtime shutdown is not -- the volume was never scanned, and counting
+/// it would put a false corruption into SCRUB_VOLUME_FAILURES.
+fn record_scrub_join_failure(
+    e: &tokio::task::JoinError,
+    vid: VolumeId,
+    what: &str,
+    broken_volume_ids: &mut Vec<u32>,
+    details: &mut Vec<String>,
+) {
+    if e.is_panic() {
+        tracing::error!(
+            volume_id = vid.0,
+            "scrub: {} task for EC volume {} panicked: {}",
+            what,
+            vid.0,
+            e
+        );
+        broken_volume_ids.push(vid.0);
+        details.push(format!("ecvol {}: {} task panicked: {}", vid.0, what, e));
+    } else {
+        tracing::info!(
+            volume_id = vid.0,
+            "scrub: {} task for EC volume {} was cancelled, skipping",
+            what,
+            vid.0
+        );
+        details.push(format!("ecvol {}: {} task cancelled; skipped", vid.0, what));
+    }
+}
+
 fn emit_scrub_metrics(mode: i32, broken_volumes: usize, broken_shards: Option<usize>) {
     let mode_label = scrub_mode_label(mode);
     crate::metrics::SCRUB_LAST_TIME_SECONDS
@@ -523,12 +564,23 @@ impl VolumeGrpcService {
                         }
                         continue;
                     };
-                    let (count, errs) = tokio::task::spawn_blocking(move || plan.run())
-                        .await
-                        .map_err(|e| {
-                            Status::internal(format!("index scrub task failed: {}", e))
-                        })?;
+                    // Counted as attempted BEFORE the join, so a failed join
+                    // cannot silently shrink total_volumes.
                     total_volumes += 1;
+                    let (count, errs) = match tokio::task::spawn_blocking(move || plan.run()).await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            record_scrub_join_failure(
+                                &e,
+                                vid,
+                                "index scrub",
+                                &mut broken_volume_ids,
+                                &mut details,
+                            );
+                            continue;
+                        }
+                    };
                     total_files += count;
                     if !errs.is_empty() {
                         broken_volume_ids.push(vid.0);
@@ -587,7 +639,7 @@ impl VolumeGrpcService {
                     // verify -> spawn_blocking; inputs are owned, no lock held.
                     if all_local && !dir.is_empty() {
                         let collection_pc = collection.clone();
-                        let (parity_broken, parity_details) = tokio::task::spawn_blocking(move || {
+                        let join = tokio::task::spawn_blocking(move || {
                             crate::storage::erasure_coding::ec_encoder::verify_ec_shards(
                                 &dir,
                                 &collection_pc,
@@ -596,9 +648,32 @@ impl VolumeGrpcService {
                                 parity_shards,
                             )
                         })
-                        .await
-                        .map_err(|e| Status::internal(format!("verify_ec_shards join: {}", e)))?
-                        .unwrap_or_else(|e| (Vec::new(), vec![format!("verify_ec_shards: {}", e)]));
+                        .await;
+                        // Unlike the other arms this must NOT `continue`: the
+                        // needle walk above already produced findings for this
+                        // volume, and dropping them here would recreate the bug
+                        // this handles, one scope down. So a panic becomes an
+                        // error for the volume, and a cancellation -- which
+                        // spawn_blocking only reports when the runtime is going
+                        // down, so this response is unlikely to reach anyone --
+                        // records in details that the parity half did not run
+                        // rather than inventing a corruption for it.
+                        let (parity_broken, parity_details) = match join {
+                            Ok(r) => r.unwrap_or_else(|e| {
+                                (Vec::new(), vec![format!("verify_ec_shards: {}", e)])
+                            }),
+                            Err(e) if e.is_panic() => (
+                                Vec::new(),
+                                vec![format!("verify_ec_shards task panicked: {}", e)],
+                            ),
+                            Err(e) => {
+                                details.push(format!(
+                                    "ecvol {}: verify_ec_shards task cancelled; parity check skipped ({})",
+                                    vid.0, e
+                                ));
+                                (Vec::new(), Vec::new())
+                            }
+                        };
 
                         let mut seen: std::collections::HashSet<u32> =
                             shard_infos.iter().map(|s| s.shard_id).collect();
@@ -638,14 +713,22 @@ impl VolumeGrpcService {
                         }
                         continue;
                     };
+                    total_volumes += 1;
                     // Synchronous CPU + file I/O: keep it off the async workers.
                     let (files, shard_infos, errs) =
-                        tokio::task::spawn_blocking(move || plan.run())
-                            .await
-                            .map_err(|e| {
-                                Status::internal(format!("local scrub task failed: {}", e))
-                            })?;
-                    total_volumes += 1;
+                        match tokio::task::spawn_blocking(move || plan.run()).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                record_scrub_join_failure(
+                                    &e,
+                                    vid,
+                                    "local scrub",
+                                    &mut broken_volume_ids,
+                                    &mut details,
+                                );
+                                continue;
+                            }
+                        };
                     total_files += files;
                     if !errs.is_empty() || !shard_infos.is_empty() {
                         broken_volume_ids.push(vid.0);
@@ -673,14 +756,22 @@ impl VolumeGrpcService {
                         }
                         continue;
                     };
+                    total_volumes += 1;
                     // Synchronous CPU + file I/O: keep it off the async workers.
                     let (blocks_scanned, broken, errs) =
-                        tokio::task::spawn_blocking(move || plan.run())
-                            .await
-                            .map_err(|e| {
-                                Status::internal(format!("checksum scrub task failed: {}", e))
-                            })?;
-                    total_volumes += 1;
+                        match tokio::task::spawn_blocking(move || plan.run()).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                record_scrub_join_failure(
+                                    &e,
+                                    vid,
+                                    "checksum scrub",
+                                    &mut broken_volume_ids,
+                                    &mut details,
+                                );
+                                continue;
+                            }
+                        };
                     total_files += blocks_scanned;
                     if !errs.is_empty() || !broken.is_empty() {
                         broken_volume_ids.push(vid.0);
