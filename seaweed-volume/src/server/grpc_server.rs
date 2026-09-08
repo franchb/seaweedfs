@@ -397,10 +397,12 @@ impl VolumeGrpcService {
         // writer land between volumes.
         //
         // NOTE: v.scrub() still runs under the guard for the duration of ONE
-        // volume, which for a large volume is still a long hold. The EC arms in
-        // scrub_ec_volume now snapshot a plan and release the lock entirely; the
-        // same treatment here needs Volume to expose an equivalent plan and is
-        // left as a follow-up.
+        // volume, which for a large volume is still a long hold. In
+        // scrub_ec_volume the INDEX, LOCAL and CHECKSUM arms snapshot a plan and
+        // scan with the guard released; FULL/READS releases it across the index
+        // walk but still re-takes it per needle, in
+        // store_ec::scrub_snapshot_under_lock. The same treatment here needs
+        // Volume to expose an equivalent plan and is left as a follow-up.
         for vid in &vids {
             // Re-resolve under a fresh guard each iteration; the volume set can
             // legitimately change between volumes now that the lock is released.
