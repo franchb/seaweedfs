@@ -4434,27 +4434,47 @@ impl VolumeServer for VolumeGrpcService {
         let mut details: Vec<String> = Vec::new();
         let mut broken_vids: Vec<VolumeId> = Vec::new();
 
-        // Scrub phase: hold store read lock, then drop before async readonly calls.
-        {
+        // Scrub phase. The store read guard is taken PER VOLUME, never across the
+        // whole loop.
+        //
+        // Holding one guard for the entire loop meant a node-wide scrub pinned the
+        // store lock for the full scan of every volume it holds. The periodic
+        // heartbeat takes store.write(); once that writer is pending, a
+        // write-preferring std::sync::RwLock queues every later reader behind it,
+        // so every HTTP handler blocks and the node stops serving and
+        // heart-beating until the scrub finishes. Re-acquiring per volume lets the
+        // writer land between volumes.
+        //
+        // NOTE: v.scrub() still runs under the guard for the duration of ONE
+        // volume, which for a large volume is still a long hold. The EC arms in
+        // scrub_ec_volume now snapshot a plan and release the lock entirely; the
+        // same treatment here needs Volume to expose an equivalent plan and is
+        // left as a follow-up.
+        let vids: Vec<VolumeId> = {
             let store = self.state.store.read().unwrap();
-            let vids: Vec<VolumeId> = if req.volume_ids.is_empty() {
+            if req.volume_ids.is_empty() {
                 store.all_volume_ids()
             } else {
                 req.volume_ids.iter().map(|&id| VolumeId(id)).collect()
-            };
+            }
+        };
 
+        {
             for vid in &vids {
-                let (_, v) = store
-                    .find_volume(*vid)
-                    .ok_or_else(|| Status::not_found(format!("volume id {} not found", vid.0)))?;
+                // Re-resolve under a fresh guard each iteration; the volume set can
+                // legitimately change between volumes now that the lock is released.
+                let (scrub_result, file_count) = {
+                    let store = self.state.store.read().unwrap();
+                    let (_, v) = store
+                        .find_volume(*vid)
+                        .ok_or_else(|| Status::not_found(format!("volume id {} not found", vid.0)))?;
+
+                    // INDEX mode (1) calls scrub_index; FULL (2) and LOCAL (3) call scrub
+                    let r = if mode == 1 { v.scrub_index() } else { v.scrub() };
+                    (r, v.file_count())
+                };
                 total_volumes += 1;
 
-                // INDEX mode (1) calls scrub_index; FULL (2) and LOCAL (3) call scrub
-                let scrub_result = if mode == 1 {
-                    v.scrub_index()
-                } else {
-                    v.scrub()
-                };
                 match scrub_result {
                     Ok((files, broken)) => {
                         total_files += files;
@@ -4467,7 +4487,7 @@ impl VolumeServer for VolumeGrpcService {
                         }
                     }
                     Err(e) => {
-                        total_files += v.file_count().max(0) as u64;
+                        total_files += file_count.max(0) as u64;
                         broken_vids.push(*vid);
                         broken_volume_ids.push(vid.0);
                         details.push(format!("vol {}: scrub error: {}", vid.0, e));
@@ -4561,13 +4581,20 @@ impl VolumeServer for VolumeGrpcService {
             match mode {
                 1 => {
                     // INDEX mode: check ecx index integrity only, no shard verification.
-                    let (count, errs) = {
+                    // Same shape as the CHECKSUM arm below: snapshot cheaply,
+                    // release the store lock, then walk the index.
+                    let plan = {
                         let store = self.state.store.read().unwrap();
                         let ecv = store.find_ec_volume(vid).ok_or_else(|| {
                             Status::not_found(format!("EC volume id {} not found", vid.0))
                         })?;
-                        ecv.scrub_index()
+                        ecv.scrub_index_plan()
                     };
+                    let (count, errs) = tokio::task::spawn_blocking(move || plan.run())
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("index scrub task failed: {}", e))
+                        })?;
                     total_volumes += 1;
                     total_files += count;
                     if !errs.is_empty() {
@@ -4683,15 +4710,29 @@ impl VolumeServer for VolumeGrpcService {
                     // CHECKSUM: verify each local shard's raw bytes against the
                     // bitrot checksum sidecar, exercising cold parity shards.
                     // Read-only. Mirrors Go's v.ChecksumScrub().
-                    let (blocks_scanned, broken, errs, collection) = {
+                    // Snapshot under a brief lock, then verify with the lock
+                    // RELEASED. checksum_scrub reads every byte of every local
+                    // shard; running that under the store read guard parks the
+                    // periodic heartbeat's store.write(), and because
+                    // std::sync::RwLock is write-preferring every later reader —
+                    // i.e. every HTTP handler — queues behind that pending
+                    // writer. The node then serves nothing, stops heart-beating,
+                    // and cannot answer this RPC's own keepalive, so the scrub
+                    // kills the connection it is running on.
+                    let (plan, collection) = {
                         let store = self.state.store.read().unwrap();
                         let ecv = store.find_ec_volume(vid).ok_or_else(|| {
                             Status::not_found(format!("EC volume id {} not found", vid.0))
                         })?;
-                        let collection = ecv.collection.clone();
-                        let (blocks, broken, errs) = ecv.checksum_scrub();
-                        (blocks, broken, errs, collection)
+                        (ecv.checksum_scrub_plan(), ecv.collection.clone())
                     };
+                    // Synchronous CPU + file I/O: keep it off the async workers.
+                    let (blocks_scanned, broken, errs) =
+                        tokio::task::spawn_blocking(move || plan.run())
+                            .await
+                            .map_err(|e| {
+                                Status::internal(format!("checksum scrub task failed: {}", e))
+                            })?;
                     total_volumes += 1;
                     total_files += blocks_scanned;
                     if !errs.is_empty() || !broken.is_empty() {

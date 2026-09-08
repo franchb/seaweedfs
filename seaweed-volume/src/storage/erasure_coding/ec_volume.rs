@@ -621,111 +621,41 @@ impl EcVolume {
     /// raising false shard-corruption alarms.
     ///
     /// This method NEVER deletes or mutates anything — it is purely diagnostic.
+    /// Everything `checksum_scrub` needs, captured WITHOUT doing any I/O.
+    ///
+    /// This exists so the verification can run with the store lock released.
+    /// `checksum_scrub` reads every byte of every local shard; done under the
+    /// caller's `store.read()` guard it parks the periodic heartbeat's
+    /// `store.write()` for the whole scan, and because `std::sync::RwLock` is
+    /// write-preferring every later reader — i.e. every HTTP handler — queues
+    /// behind that pending writer. The server then serves nothing, stops
+    /// heart-beating, and cannot answer the scrub's own gRPC keepalive, so the
+    /// scrub kills the connection it is running on. Measured on a 4.46 cluster:
+    /// `collect_heartbeat_with_snapshot` blocked 27.97s of a 30s window, and a
+    /// `/status` request issued mid-scrub returned 200 only after waiting 120s.
+    ///
+    /// Every field here is owned, so the guard can be dropped before `run()`.
+    pub fn checksum_scrub_plan(&self) -> EcChecksumScrubPlan {
+        let (prot, status) = self.bitrot_protection();
+        EcChecksumScrubPlan {
+            volume_id: self.volume_id,
+            base: self.base_name(),
+            prot,
+            status,
+            parity_shards: self.parity_shards,
+            local_shards: self
+                .shards
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| slot.as_ref().map(|_| i as u32))
+                .collect(),
+        }
+    }
+
+    /// Convenience wrapper preserving the original call shape. Callers that
+    /// hold the store lock MUST use `checksum_scrub_plan()` + `run()` instead.
     pub fn checksum_scrub(&self) -> (u64, Vec<u32>, Vec<String>) {
-        use crate::storage::erasure_coding::ec_bitrot;
-        use crate::storage::erasure_coding::ec_bitrot::BitrotStatus;
-
-        let mut errors: Vec<String> = Vec::new();
-
-        // Resolve the active-generation protection AND its status, mirroring
-        // Go's `ChecksumScrub` (`prot, status := ecv.BitrotProtection()`):
-        //   - BitrotOff   => sidecars are OPTIONAL; an absent (or generation/
-        //     config-mismatched) sidecar simply means protection is not enabled
-        //     for this generation. Return a CLEAN, EMPTY result — NOT an error —
-        //     so legacy/intentionally-unprotected volumes are never reported
-        //     broken. (Go: `case BitrotOff: return 0, nil, nil`.)
-        //   - BitrotInvalid => the sidecar is PRESENT but malformed/unverifiable
-        //     (self-integrity or manifest failure). That is the only status that
-        //     yields an integrity error here.
-        //   - BitrotOn    => scan local shards against it.
-        let prot = match self.bitrot_protection() {
-            (_, BitrotStatus::Off) => {
-                // Unprotected generation: nothing to verify. Not an error.
-                return (0, Vec::new(), Vec::new());
-            }
-            (_, BitrotStatus::Invalid) => {
-                return (
-                    0,
-                    Vec::new(),
-                    vec![format!(
-                        "EC volume {} bitrot sidecar is malformed/unverifiable (sidecar integrity)",
-                        self.volume_id.0
-                    )],
-                );
-            }
-            (Some(p), BitrotStatus::On) => p,
-            (None, BitrotStatus::On) => {
-                // Unreachable: BitrotOn always carries a loaded sidecar. Treat a
-                // missing payload defensively as protection off (clean no-op).
-                return (0, Vec::new(), Vec::new());
-            }
-        };
-
-        let block_size = prot.block_size as i64;
-        let generation = prot.generation;
-        let base = self.base_name();
-
-        let mut blocks_scanned: u64 = 0;
-        let mut mismatched_shards: Vec<u32> = Vec::new();
-        // Track shards whose blocks ALL mismatch (wholesale) to detect a
-        // stale/wrong sidecar.
-        let mut wholesale_mismatch = 0usize;
-
-        for (i, slot) in self.shards.iter().enumerate() {
-            if slot.is_none() {
-                continue; // not local
-            }
-            let shard_id = i as u32;
-            let Some(entry) = ec_bitrot::shard_checksums(&prot, shard_id) else {
-                errors.push(format!(
-                    "EC volume {} shard {} present but missing from sidecar manifest",
-                    self.volume_id.0, shard_id
-                ));
-                continue;
-            };
-
-            // Resolve the on-disk shard file path for the active generation,
-            // mirroring EcVolumeShard::reopen_against_generation's convention.
-            let path = if generation == 0 {
-                format!("{}.ec{:02}", base, shard_id)
-            } else {
-                format!("{}.ec{:02}.v{}", base, shard_id, generation)
-            };
-
-            let expected_blocks = entry.block_crc32c.len() / 4;
-            match ec_bitrot::verify_shard_file_blocks(&path, entry, block_size) {
-                Ok(mismatched) => {
-                    blocks_scanned += expected_blocks as u64;
-                    if !mismatched.is_empty() {
-                        mismatched_shards.push(shard_id);
-                        if expected_blocks > 0 && mismatched.len() == expected_blocks {
-                            wholesale_mismatch += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!(
-                        "EC volume {} shard {} scrub read error: {}",
-                        self.volume_id.0, shard_id, e
-                    ));
-                }
-            }
-        }
-
-        // If more shards mismatch wholesale than parity can mask, the sidecar
-        // itself is the likely culprit (stale generation / wrong volume), so
-        // suppress the shard-corruption verdict and flag a sidecar-integrity
-        // issue instead.
-        if wholesale_mismatch > self.parity_shards as usize {
-            errors.push(format!(
-                "EC volume {}: {} shards mismatch wholesale (> {} parity); suspect stale/wrong sidecar, not shard corruption",
-                self.volume_id.0, wholesale_mismatch, self.parity_shards
-            ));
-            mismatched_shards.clear();
-        }
-
-        mismatched_shards.sort_unstable();
-        (blocks_scanned, mismatched_shards, errors)
+        self.checksum_scrub_plan().run()
     }
 
     /// Walk the .ecj journal and populate `deleted_needles`. Called once
@@ -1281,31 +1211,23 @@ impl EcVolume {
     /// ScrubIndex verifies index integrity of an EC volume.
     /// Matches Go's `(ev *EcVolume) ScrubIndex()` → `idx.CheckIndexFile()`.
     /// Returns (entry_count, errors).
-    pub fn scrub_index(&self) -> (u64, Vec<String>) {
-        if self.ecx_file.is_none() {
-            return (
-                0,
-                vec![format!(
-                    "no ECX file associated with EC volume {}",
-                    self.volume_id.0
-                )],
-            );
+    /// Snapshot for `scrub_index`, captured without I/O so the index walk can
+    /// run with the store lock released. Same rationale as
+    /// `checksum_scrub_plan` — see its comment.
+    pub fn scrub_index_plan(&self) -> EcIndexScrubPlan {
+        EcIndexScrubPlan {
+            volume_id: self.volume_id,
+            has_ecx_file: self.ecx_file.is_some(),
+            ecx_path: self.ecx_file_name(),
+            ecx_file_size: self.ecx_file_size,
+            version: self.version,
         }
-        if self.ecx_file_size == 0 {
-            return (
-                0,
-                vec![format!("zero-size ECX file for EC volume {}", self.volume_id.0)],
-            );
-        }
+    }
 
-        // Walk a private fd so the structural scan never moves the shared
-        // ecx_file cursor (the cached handle is read positionally elsewhere).
-        let ecx_path = self.ecx_file_name();
-        let mut ecx_file = match File::open(&ecx_path) {
-            Ok(f) => f,
-            Err(e) => return (0, vec![format!("open ECX file {}: {}", ecx_path, e)]),
-        };
-        crate::storage::idx::check_index_file(&mut ecx_file, self.ecx_file_size, self.version)
+    /// Convenience wrapper preserving the original call shape. Callers holding
+    /// the store lock MUST use `scrub_index_plan()` + `run()` instead.
+    pub fn scrub_index(&self) -> (u64, Vec<String>) {
+        self.scrub_index_plan().run()
     }
 
     /// ScrubLocal verifies each needle against the LOCAL shards only; it cannot
@@ -1962,6 +1884,92 @@ mod tests {
         let (prot, status) = vol.bitrot_protection();
         assert_eq!(status, BitrotStatus::On);
         assert_eq!(prot.unwrap().shards.len(), 14);
+    }
+
+    /// REGRESSION: the scrub plans must be SELF-CONTAINED, so the gRPC handler can
+    /// drop the store lock before the scan runs.
+    ///
+    /// `checksum_scrub` reads every byte of every local shard. Running that under
+    /// the caller's `store.read()` guard parked the periodic heartbeat's
+    /// `store.write()`, and because `std::sync::RwLock` is write-preferring, every
+    /// later reader — i.e. every HTTP handler — queued behind that pending writer.
+    /// The node served nothing, stopped heart-beating, and could not answer the
+    /// scrub RPC's own keepalive, so the scrub killed the connection it ran on.
+    /// Measured on a live 4.46 node: `collect_heartbeat_with_snapshot` blocked
+    /// 27.97s of a 30s window, and a `/status` request issued mid-scrub returned
+    /// 200 only after waiting 120s.
+    ///
+    /// The volume is DROPPED before the plans run, and the plans are moved to
+    /// another thread. A plan that borrowed from `EcVolume` could do neither, so
+    /// this stops COMPILING if the snapshot ever regresses to a borrow.
+    #[test]
+    fn test_scrub_plans_are_self_contained_and_match_direct_call() {
+        use crate::storage::needle_map::NeedleMapKind;
+        use crate::storage::volume::Volume;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        for i in 1..=8 {
+            let data = format!("test data for needle {} with a bit more length", i);
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: data.as_bytes().to_vec(),
+                data_size: data.len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        v.sync_to_disk().unwrap();
+        v.close();
+        crate::storage::erasure_coding::ec_encoder::write_ec_files(dir, dir, "", VolumeId(1), 10, 4)
+            .unwrap();
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(1)).unwrap();
+        for id in 0..14u8 {
+            vol.add_shard(EcVolumeShard::new(dir, "", VolumeId(1), id))
+                .unwrap();
+        }
+
+        // Baseline via the original call shape, with the volume still alive.
+        let direct_checksum = vol.checksum_scrub();
+        let direct_index = vol.scrub_index();
+        assert!(
+            direct_checksum.0 > 0,
+            "fixture scanned no blocks, so the equality below would be vacuous"
+        );
+
+        let checksum_plan = vol.checksum_scrub_plan();
+        let index_plan = vol.scrub_index_plan();
+
+        // The lock (and here the whole volume) is gone before the scan runs.
+        drop(vol);
+
+        let (from_plan_checksum, from_plan_index) =
+            std::thread::spawn(move || (checksum_plan.run(), index_plan.run()))
+                .join()
+                .expect("scrub plans must be runnable off the owning thread");
+
+        assert_eq!(
+            from_plan_checksum, direct_checksum,
+            "checksum scrub result changed when run from a released-lock plan"
+        );
+        assert_eq!(
+            from_plan_index, direct_index,
+            "index scrub result changed when run from a released-lock plan"
+        );
     }
 
     /// CHECKSUM scrub verifies clean shards against the sidecar and flags a shard
@@ -2772,5 +2780,170 @@ mod uniform_layout_tests {
         )
         .unwrap();
         assert_eq!((ds, ps, bs), (12, 4, 3 * 1024 * 1024));
+    }
+}
+
+/// Self-contained input for an EC checksum scrub, snapshotted from an
+/// `EcVolume` under a brief lock so the scan itself needs no store access.
+#[derive(Debug, Clone)]
+pub struct EcChecksumScrubPlan {
+    pub volume_id: VolumeId,
+    /// `volume_file_name(dir, collection, volume_id)` — shard paths derive from this.
+    pub base: String,
+    pub prot: Option<crate::pb::volume_server_pb::EcBitrotProtection>,
+    pub status: crate::storage::erasure_coding::ec_bitrot::BitrotStatus,
+    pub parity_shards: u32,
+    /// Shard ids held locally; non-local slots are skipped, as before.
+    pub local_shards: Vec<u32>,
+}
+
+impl EcChecksumScrubPlan {
+    /// The byte-verification pass. Touches only the filesystem — no store, no
+    /// lock — so it is safe to hand to `spawn_blocking`.
+    pub fn run(self) -> (u64, Vec<u32>, Vec<String>) {
+        use crate::storage::erasure_coding::ec_bitrot;
+        use crate::storage::erasure_coding::ec_bitrot::BitrotStatus;
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // Resolve the active-generation protection AND its status, mirroring
+        // Go's `ChecksumScrub` (`prot, status := ecv.BitrotProtection()`):
+        //   - BitrotOff   => sidecars are OPTIONAL; an absent (or generation/
+        //     config-mismatched) sidecar simply means protection is not enabled
+        //     for this generation. Return a CLEAN, EMPTY result — NOT an error —
+        //     so legacy/intentionally-unprotected volumes are never reported
+        //     broken. (Go: `case BitrotOff: return 0, nil, nil`.)
+        //   - BitrotInvalid => the sidecar is PRESENT but malformed/unverifiable
+        //     (self-integrity or manifest failure). That is the only status that
+        //     yields an integrity error here.
+        //   - BitrotOn    => scan local shards against it.
+        let prot = match (self.prot.clone(), self.status) {
+            (_, BitrotStatus::Off) => {
+                // Unprotected generation: nothing to verify. Not an error.
+                return (0, Vec::new(), Vec::new());
+            }
+            (_, BitrotStatus::Invalid) => {
+                return (
+                    0,
+                    Vec::new(),
+                    vec![format!(
+                        "EC volume {} bitrot sidecar is malformed/unverifiable (sidecar integrity)",
+                        self.volume_id.0
+                    )],
+                );
+            }
+            (Some(p), BitrotStatus::On) => p,
+            (None, BitrotStatus::On) => {
+                // Unreachable: BitrotOn always carries a loaded sidecar. Treat a
+                // missing payload defensively as protection off (clean no-op).
+                return (0, Vec::new(), Vec::new());
+            }
+        };
+
+        let block_size = prot.block_size as i64;
+        let generation = prot.generation;
+        let base = self.base.clone();
+
+        let mut blocks_scanned: u64 = 0;
+        let mut mismatched_shards: Vec<u32> = Vec::new();
+        // Track shards whose blocks ALL mismatch (wholesale) to detect a
+        // stale/wrong sidecar.
+        let mut wholesale_mismatch = 0usize;
+
+        for &shard_id in &self.local_shards {
+            let Some(entry) = ec_bitrot::shard_checksums(&prot, shard_id) else {
+                errors.push(format!(
+                    "EC volume {} shard {} present but missing from sidecar manifest",
+                    self.volume_id.0, shard_id
+                ));
+                continue;
+            };
+
+            // Resolve the on-disk shard file path for the active generation,
+            // mirroring EcVolumeShard::reopen_against_generation's convention.
+            let path = if generation == 0 {
+                format!("{}.ec{:02}", base, shard_id)
+            } else {
+                format!("{}.ec{:02}.v{}", base, shard_id, generation)
+            };
+
+            let expected_blocks = entry.block_crc32c.len() / 4;
+            match ec_bitrot::verify_shard_file_blocks(&path, entry, block_size) {
+                Ok(mismatched) => {
+                    blocks_scanned += expected_blocks as u64;
+                    if !mismatched.is_empty() {
+                        mismatched_shards.push(shard_id);
+                        if expected_blocks > 0 && mismatched.len() == expected_blocks {
+                            wholesale_mismatch += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "EC volume {} shard {} scrub read error: {}",
+                        self.volume_id.0, shard_id, e
+                    ));
+                }
+            }
+        }
+
+        // If more shards mismatch wholesale than parity can mask, the sidecar
+        // itself is the likely culprit (stale generation / wrong volume), so
+        // suppress the shard-corruption verdict and flag a sidecar-integrity
+        // issue instead.
+        if wholesale_mismatch > self.parity_shards as usize {
+            errors.push(format!(
+                "EC volume {}: {} shards mismatch wholesale (> {} parity); suspect stale/wrong sidecar, not shard corruption",
+                self.volume_id.0, wholesale_mismatch, self.parity_shards
+            ));
+            mismatched_shards.clear();
+        }
+
+        mismatched_shards.sort_unstable();
+        (blocks_scanned, mismatched_shards, errors)
+    }
+}
+
+/// Self-contained input for an EC index scrub.
+#[derive(Debug, Clone)]
+pub struct EcIndexScrubPlan {
+    pub volume_id: VolumeId,
+    pub has_ecx_file: bool,
+    pub ecx_path: String,
+    pub ecx_file_size: i64,
+    pub version: Version,
+}
+
+impl EcIndexScrubPlan {
+    /// Structural walk of the .ecx index. Filesystem only — no store, no lock.
+    pub fn run(self) -> (u64, Vec<String>) {
+        if !self.has_ecx_file {
+            return (
+                0,
+                vec![format!(
+                    "no ECX file associated with EC volume {}",
+                    self.volume_id.0
+                )],
+            );
+        }
+        if self.ecx_file_size == 0 {
+            return (
+                0,
+                vec![format!("zero-size ECX file for EC volume {}", self.volume_id.0)],
+            );
+        }
+
+        // Walk a private fd so the structural scan never moves the shared
+        // ecx_file cursor (the cached handle is read positionally elsewhere).
+        let mut ecx_file = match File::open(&self.ecx_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    0,
+                    vec![format!("open ECX file {}: {}", self.ecx_path, e)],
+                )
+            }
+        };
+        crate::storage::idx::check_index_file(&mut ecx_file, self.ecx_file_size, self.version)
     }
 }
