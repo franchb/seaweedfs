@@ -635,20 +635,51 @@ impl EcVolume {
     /// `/status` request issued mid-scrub returned 200 only after waiting 120s.
     ///
     /// Every field here is owned, so the guard can be dropped before `run()`.
+    ///
+    /// The local shards are OPENED here, under the guard, and `run()` reads
+    /// through those handles. Resolving the path again during the scan would
+    /// let a teardown that legitimately unlinks the shards — the heartbeat's
+    /// `delete_expired_ec_volumes`, or `volume_ec_shards_delete` — turn an
+    /// intentional removal into a "scrub read error" and report the volume
+    /// broken; the store read guard used to serialize the scan against those
+    /// writers, and it no longer does. An open fd survives the unlink, which is
+    /// also how Go reads: `ChecksumScrub` goes through `shard.ReadAt`, never
+    /// through a path.
     pub fn checksum_scrub_plan(&self) -> EcChecksumScrubPlan {
         let (prot, status) = self.bitrot_protection();
+
+        // Only BitrotOn reaches the shard loop in `run()`; the other statuses
+        // return before touching a handle, so opening for them buys nothing.
+        let shards = match (&prot, status) {
+            (Some(p), crate::storage::erasure_coding::ec_bitrot::BitrotStatus::On) => {
+                let base = self.base_name();
+                let generation = p.generation;
+                self.shards
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slot.is_some())
+                    .map(|(i, _)| {
+                        let shard_id = i as u32;
+                        // Mirrors EcVolumeShard::reopen_against_generation's
+                        // naming convention.
+                        let path = if generation == 0 {
+                            format!("{}.ec{:02}", base, shard_id)
+                        } else {
+                            format!("{}.ec{:02}.v{}", base, shard_id, generation)
+                        };
+                        (shard_id, File::open(&path))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
         EcChecksumScrubPlan {
             volume_id: self.volume_id,
-            base: self.base_name(),
             prot,
             status,
             parity_shards: self.parity_shards,
-            local_shards: self
-                .shards
-                .iter()
-                .enumerate()
-                .filter_map(|(i, slot)| slot.as_ref().map(|_| i as u32))
-                .collect(),
+            shards,
         }
     }
 
@@ -1215,12 +1246,20 @@ impl EcVolume {
     /// run with the store lock released. Same rationale as
     /// `checksum_scrub_plan` — see its comment.
     pub fn scrub_index_plan(&self) -> EcIndexScrubPlan {
+        let ecx_path = self.ecx_file_name();
+        // Opened here, under the guard, for the same reason the checksum plan
+        // captures its shard handles: a teardown between plan and run must not
+        // turn an intentional removal into an index-scrub error. A fresh open
+        // (not a try_clone of the cached handle) keeps the private cursor the
+        // structural walk needs.
+        let ecx_handle = File::open(&ecx_path);
         EcIndexScrubPlan {
             volume_id: self.volume_id,
             has_ecx_file: self.ecx_file.is_some(),
-            ecx_path: self.ecx_file_name(),
+            ecx_path,
             ecx_file_size: self.ecx_file_size,
             version: self.version,
+            ecx_handle,
         }
     }
 
@@ -1969,6 +2008,102 @@ mod tests {
         assert_eq!(
             from_plan_index, direct_index,
             "index scrub result changed when run from a released-lock plan"
+        );
+    }
+
+    /// REGRESSION: a scrub running with the store lock RELEASED must not turn a
+    /// concurrent, intentional removal into a corruption report.
+    ///
+    /// The scan no longer runs under `store.read()`, so a store writer —
+    /// the heartbeat's `delete_expired_ec_volumes`, or `volume_ec_shards_delete`
+    /// — can unmount an EC volume and unlink its files while the scan is in
+    /// flight. Re-resolving the path at read time would surface that as
+    /// "scrub read error" and put the volume in `broken_volume_ids`. The plans
+    /// therefore capture open handles under the guard, which is also how Go
+    /// reads (`ChecksumScrub` -> `shard.ReadAt`, never a path).
+    ///
+    /// Deleting every file after the plans are built is the whole test: with
+    /// path-based reads the results diverge from the direct call, with captured
+    /// handles they are identical.
+    #[test]
+    fn test_scrub_plans_survive_files_removed_after_snapshot() {
+        use crate::storage::needle_map::NeedleMapKind;
+        use crate::storage::volume::Volume;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        for i in 1..=8 {
+            let data = format!("test data for needle {} with a bit more length", i);
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: data.as_bytes().to_vec(),
+                data_size: data.len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        v.sync_to_disk().unwrap();
+        v.close();
+        crate::storage::erasure_coding::ec_encoder::write_ec_files(dir, dir, "", VolumeId(1), 10, 4)
+            .unwrap();
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(1)).unwrap();
+        for id in 0..14u8 {
+            vol.add_shard(EcVolumeShard::new(dir, "", VolumeId(1), id))
+                .unwrap();
+        }
+
+        // Baseline with every file present and the volume still mounted.
+        let direct_checksum = vol.checksum_scrub();
+        let direct_index = vol.scrub_index();
+        assert!(
+            direct_checksum.0 > 0,
+            "fixture scanned no blocks, so the equality below would be vacuous"
+        );
+        assert!(
+            direct_checksum.2.is_empty() && direct_index.1.is_empty(),
+            "fixture is not clean, so a false error could not be told apart: {:?} {:?}",
+            direct_checksum.2,
+            direct_index.1
+        );
+
+        let checksum_plan = vol.checksum_scrub_plan();
+        let index_plan = vol.scrub_index_plan();
+
+        // The teardown a store writer would perform, after the plans exist.
+        drop(vol);
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(1));
+        for id in 0..14u8 {
+            std::fs::remove_file(format!("{}.ec{:02}", base, id)).unwrap();
+        }
+        std::fs::remove_file(format!("{}.ecx", base)).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("{}.ec00", base)).exists(),
+            "the removal under test did not happen"
+        );
+
+        assert_eq!(
+            checksum_plan.run(),
+            direct_checksum,
+            "shard files unlinked after the snapshot were reported as corruption"
+        );
+        assert_eq!(
+            index_plan.run(),
+            direct_index,
+            "the .ecx unlinked after the snapshot was reported as an index error"
         );
     }
 
@@ -2785,16 +2920,20 @@ mod uniform_layout_tests {
 
 /// Self-contained input for an EC checksum scrub, snapshotted from an
 /// `EcVolume` under a brief lock so the scan itself needs no store access.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: it owns the shard handles, and duplicating them would defeat
+/// the point of capturing exactly the files that were mounted under the guard.
+#[derive(Debug)]
 pub struct EcChecksumScrubPlan {
     pub volume_id: VolumeId,
-    /// `volume_file_name(dir, collection, volume_id)` — shard paths derive from this.
-    pub base: String,
     pub prot: Option<crate::pb::volume_server_pb::EcBitrotProtection>,
     pub status: crate::storage::erasure_coding::ec_bitrot::BitrotStatus,
     pub parity_shards: u32,
-    /// Shard ids held locally; non-local slots are skipped, as before.
-    pub local_shards: Vec<u32>,
+    /// One entry per LOCAL shard: its id and the handle opened while the store
+    /// lock was held (or the open error to report). Private so the plan can
+    /// only be built by `EcVolume::checksum_scrub_plan`, which is what makes
+    /// "opened under the guard" an invariant rather than a convention.
+    shards: Vec<(u32, std::io::Result<File>)>,
 }
 
 impl EcChecksumScrubPlan {
@@ -2817,7 +2956,7 @@ impl EcChecksumScrubPlan {
         //     (self-integrity or manifest failure). That is the only status that
         //     yields an integrity error here.
         //   - BitrotOn    => scan local shards against it.
-        let prot = match (self.prot.clone(), self.status) {
+        let prot = match (self.prot, self.status) {
             (_, BitrotStatus::Off) => {
                 // Unprotected generation: nothing to verify. Not an error.
                 return (0, Vec::new(), Vec::new());
@@ -2841,8 +2980,6 @@ impl EcChecksumScrubPlan {
         };
 
         let block_size = prot.block_size as i64;
-        let generation = prot.generation;
-        let base = self.base.clone();
 
         let mut blocks_scanned: u64 = 0;
         let mut mismatched_shards: Vec<u32> = Vec::new();
@@ -2850,7 +2987,7 @@ impl EcChecksumScrubPlan {
         // stale/wrong sidecar.
         let mut wholesale_mismatch = 0usize;
 
-        for &shard_id in &self.local_shards {
+        for (shard_id, handle) in self.shards {
             let Some(entry) = ec_bitrot::shard_checksums(&prot, shard_id) else {
                 errors.push(format!(
                     "EC volume {} shard {} present but missing from sidecar manifest",
@@ -2859,16 +2996,21 @@ impl EcChecksumScrubPlan {
                 continue;
             };
 
-            // Resolve the on-disk shard file path for the active generation,
-            // mirroring EcVolumeShard::reopen_against_generation's convention.
-            let path = if generation == 0 {
-                format!("{}.ec{:02}", base, shard_id)
-            } else {
-                format!("{}.ec{:02}.v{}", base, shard_id, generation)
+            // The handle was opened under the store lock; reading through it
+            // means a concurrent unmount/unlink cannot masquerade as bitrot.
+            let file = match &handle {
+                Ok(f) => f,
+                Err(e) => {
+                    errors.push(format!(
+                        "EC volume {} shard {} scrub read error: {}",
+                        self.volume_id.0, shard_id, e
+                    ));
+                    continue;
+                }
             };
 
             let expected_blocks = entry.block_crc32c.len() / 4;
-            match ec_bitrot::verify_shard_file_blocks(&path, entry, block_size) {
+            match ec_bitrot::verify_shard_blocks(file, entry, block_size) {
                 Ok(mismatched) => {
                     blocks_scanned += expected_blocks as u64;
                     if !mismatched.is_empty() {
@@ -2905,13 +3047,18 @@ impl EcChecksumScrubPlan {
 }
 
 /// Self-contained input for an EC index scrub.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: it owns the .ecx handle opened under the store lock.
+#[derive(Debug)]
 pub struct EcIndexScrubPlan {
     pub volume_id: VolumeId,
     pub has_ecx_file: bool,
     pub ecx_path: String,
     pub ecx_file_size: i64,
     pub version: Version,
+    /// The .ecx handle opened while the store lock was held. Private, so the
+    /// plan can only come from `EcVolume::scrub_index_plan`.
+    ecx_handle: std::io::Result<File>,
 }
 
 impl EcIndexScrubPlan {
@@ -2933,9 +3080,10 @@ impl EcIndexScrubPlan {
             );
         }
 
-        // Walk a private fd so the structural scan never moves the shared
-        // ecx_file cursor (the cached handle is read positionally elsewhere).
-        let mut ecx_file = match File::open(&self.ecx_path) {
+        // A private fd, so the structural scan never moves the shared ecx_file
+        // cursor (the cached handle is read positionally elsewhere). Checked
+        // after the two guards above so the error ordering is unchanged.
+        let mut ecx_file = match self.ecx_handle {
             Ok(f) => f,
             Err(e) => {
                 return (
