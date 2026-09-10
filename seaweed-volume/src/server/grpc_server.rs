@@ -2714,14 +2714,31 @@ impl VolumeServer for VolumeGrpcService {
             let mut draining_seconds = idle_timeout as i64;
 
             loop {
-                // Use binary search to find starting offset, then scan from there
+                // Use binary search to find starting offset, then scan from there.
+                //
+                // `is_last` means the client is already caught up: nothing in the
+                // volume is newer than last_timestamp_ns. Go answers that with a
+                // heartbeat and does NOT scan (volume_grpc_tail.go, `if isLastOne`).
+                // Dropping that flag here is expensive, not just untidy: the scan
+                // below materialises every needle from its start offset to EOF, and
+                // when the search yields offset 0 the start offset falls back to
+                // sb_size -- the whole volume. A volume being moved is marked
+                // read-only first, so it is ALWAYS caught up, and the tail loop
+                // would re-read and discard the entire volume every 2s until the
+                // idle timeout expired. Measured at ~2.17 GB re-read six times in
+                // 35s for a 2.15 GB volume, which OOM-kills the source under a
+                // per-process memory cap.
+                let mut caught_up = false;
                 let scan_result = {
                     let store = state.store.read().unwrap();
                     if let Some((_, vol)) = store.find_volume(vid) {
                         let start_offset = if last_timestamp_ns > 0 {
                             match vol.binary_search_by_append_at_ns(last_timestamp_ns) {
-                                Ok((offset, _is_last)) => {
-                                    if offset.is_zero() {
+                                Ok((offset, is_last)) => {
+                                    if is_last {
+                                        caught_up = true;
+                                        Ok(sb_size)
+                                    } else if offset.is_zero() {
                                         Ok(sb_size)
                                     } else {
                                         Ok(offset.to_actual_offset() as u64)
@@ -2750,6 +2767,27 @@ impl VolumeServer for VolumeGrpcService {
                         break;
                     }
                 };
+
+                // Caught up: heartbeat and skip the scan entirely, as Go does.
+                if caught_up {
+                    let msg = volume_server_pb::VolumeTailSenderResponse {
+                        is_last_chunk: true,
+                        version,
+                        ..Default::default()
+                    };
+                    if tx.send(Ok(msg)).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if idle_timeout == 0 {
+                        continue;
+                    }
+                    draining_seconds -= 1;
+                    if draining_seconds <= 0 {
+                        return; // EOF
+                    }
+                    continue;
+                }
 
                 let scan_inner = match scan_result {
                     Ok(r) => r,
