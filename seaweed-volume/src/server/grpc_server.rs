@@ -2728,48 +2728,56 @@ impl VolumeServer for VolumeGrpcService {
                 // idle timeout expired. Measured at ~2.17 GB re-read six times in
                 // 35s for a 2.15 GB volume, which OOM-kills the source under a
                 // per-process memory cap.
-                let mut caught_up = false;
-                let scan_result = {
+                // Resolve the start offset and the caught-up flag FIRST, under a
+                // brief lock, and only scan if there is actually something new.
+                // The binary search is over the .idx and is cheap; the scan is the
+                // expensive part and must not be run speculatively.
+                let resolved = {
                     let store = state.store.read().unwrap();
-                    if let Some((_, vol)) = store.find_volume(vid) {
-                        let start_offset = if last_timestamp_ns > 0 {
-                            match vol.binary_search_by_append_at_ns(last_timestamp_ns) {
-                                Ok((offset, is_last)) => {
-                                    if is_last {
-                                        caught_up = true;
-                                        Ok(sb_size)
-                                    } else if offset.is_zero() {
-                                        Ok(sb_size)
-                                    } else {
-                                        Ok(offset.to_actual_offset() as u64)
+                    match store.find_volume(vid) {
+                        Some((_, vol)) => {
+                            if last_timestamp_ns > 0 {
+                                match vol.binary_search_by_append_at_ns(last_timestamp_ns) {
+                                    Ok((offset, is_last)) => {
+                                        let off = if offset.is_zero() {
+                                            sb_size
+                                        } else {
+                                            offset.to_actual_offset() as u64
+                                        };
+                                        Some(Ok((off, is_last)))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "fail to locate by appendAtNs {}: {}",
+                                            last_timestamp_ns,
+                                            e
+                                        );
+                                        Some(Err(format!(
+                                            "fail to locate by appendAtNs {}: {}",
+                                            last_timestamp_ns, e
+                                        )))
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "fail to locate by appendAtNs {}: {}",
-                                        last_timestamp_ns,
-                                        e
-                                    );
-                                    Err(format!(
-                                        "fail to locate by appendAtNs {}: {}",
-                                        last_timestamp_ns, e
-                                    ))
-                                }
+                            } else {
+                                // No timestamp yet: the caller wants everything.
+                                Some(Ok((sb_size, false)))
                             }
-                        } else {
-                            Ok(sb_size)
-                        };
-                        match start_offset {
-                            Ok(off) => Ok(vol.scan_raw_needles_from(off)),
-                            Err(msg) => Err(msg),
                         }
-                    } else {
-                        break;
+                        None => None,
                     }
                 };
 
-                // Caught up: heartbeat and skip the scan entirely, as Go does.
-                if caught_up {
+                let (start_offset, is_last) = match resolved {
+                    None => break,
+                    Some(Err(msg)) => {
+                        let _ = tx.send(Err(Status::internal(msg))).await;
+                        return;
+                    }
+                    Some(Ok(v)) => v,
+                };
+
+                // Caught up: heartbeat WITHOUT scanning, as Go does.
+                if is_last {
                     let msg = volume_server_pb::VolumeTailSenderResponse {
                         is_last_chunk: true,
                         version,
@@ -2789,19 +2797,19 @@ impl VolumeServer for VolumeGrpcService {
                     continue;
                 }
 
-                let scan_inner = match scan_result {
-                    Ok(r) => r,
-                    Err(msg) => {
-                        let _ = tx.send(Err(Status::internal(msg))).await;
-                        return;
+                // Not caught up: now do the expensive scan.
+                let scan_result = {
+                    let store = state.store.read().unwrap();
+                    match store.find_volume(vid) {
+                        Some((_, vol)) => vol.scan_raw_needles_from(start_offset),
+                        None => break,
                     }
                 };
 
-                let entries = match scan_inner {
+                let entries = match scan_result {
                     Ok(e) => e,
                     Err(_) => break,
                 };
-
                 // Filter entries since last_timestamp_ns
                 let mut last_processed_ns = last_timestamp_ns;
                 let mut sent_any = false;
