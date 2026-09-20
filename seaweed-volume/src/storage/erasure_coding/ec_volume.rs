@@ -46,6 +46,19 @@ pub(crate) struct ShardLocationCache {
     stale: bool,
 }
 
+/// Bytes read per positional read when seeding `deleted_needles` from `.ecj`.
+/// A multiple of `NEEDLE_ID_SIZE`; 1 MiB is 131072 entries per syscall.
+const ECJ_LOAD_CHUNK_BYTES: usize = 1 << 20;
+
+/// A `.ecj` smaller than this is never rewritten, however redundant. Below a
+/// megabyte the duplication costs nothing and the rewrite is pure churn.
+const ECJ_COMPACT_MIN_BYTES: i64 = 1 << 20;
+
+/// Rewrite only when the journal is at least this many times larger than the
+/// set it encodes. A journal legitimately holds one entry per delete, so some
+/// slack is normal; an order of magnitude is not.
+const ECJ_COMPACT_RATIO: i64 = 4;
+
 pub struct EcVolume {
     pub volume_id: VolumeId,
     pub collection: String,
@@ -511,6 +524,18 @@ impl EcVolume {
         // Seed the in-memory deleted set from the journal.
         vol.load_deleted_needles_from_ecj()?;
 
+        // Then fold the journal back down to the set it encodes, if the append
+        // paths have bloated it. Non-fatal: a volume that cannot rewrite its
+        // journal (read-only disk, no space) must still mount and serve — the
+        // set is already correct in memory.
+        if let Err(e) = vol.maybe_compact_ecj() {
+            tracing::warn!(
+                volume_id = volume_id.0,
+                error = %e,
+                "compact .ecj",
+            );
+        }
+
         // Load the generation-0 EC bitrot checksum sidecar. Optional, except
         // when it contradicts the volume's own geometry — see
         // load_bitrot_for_generation.
@@ -696,6 +721,14 @@ impl EcVolume {
     /// from `new()` under exclusive ownership of the just-constructed
     /// EcVolume, so locking is not strictly required — but we take the
     /// write lock anyway for symmetry with later mutations.
+    ///
+    /// Read in large chunks. This previously issued one `NEEDLE_ID_SIZE`-byte
+    /// positional read per entry, which is fine for a healthy journal (a few
+    /// KB) and catastrophic for a bloated one: at the 1.51 TB seen in
+    /// production that is ~188e9 syscalls, so the server spun at 100% of one
+    /// core with a 31 MB RSS — the set stays small because the ids repeat —
+    /// and never opened its HTTP port, which made the master unregister every
+    /// volume it held. Chunked reads cut that by ~`ECJ_LOAD_CHUNK_BYTES / 8`.
     fn load_deleted_needles_from_ecj(&mut self) -> io::Result<()> {
         let ecj_file = match self.ecj_file.as_ref() {
             Some(f) => f,
@@ -704,32 +737,125 @@ impl EcVolume {
         if self.ecj_file_size < NEEDLE_ID_SIZE as i64 {
             return Ok(());
         }
-        let mut buf = [0u8; NEEDLE_ID_SIZE];
-        let mut set = self
-            .deleted_needles
-            .write()
-            .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?;
-        let mut off: i64 = 0;
-        while off + NEEDLE_ID_SIZE as i64 <= self.ecj_file_size {
+
+        // Build into a local set and merge at the end. The previous version
+        // held the `deleted_needles` write lock for the whole scan, which on a
+        // bloated journal is the entire (unbounded) startup.
+        let mut loaded: HashSet<NeedleId> = HashSet::new();
+        let mut buf = vec![0u8; ECJ_LOAD_CHUNK_BYTES];
+        let end = self.ecj_file_size as u64;
+        let mut off: u64 = 0;
+        while off + NEEDLE_ID_SIZE as u64 <= end {
+            // Whole entries only; a trailing partial record is ignored, as the
+            // per-entry loop did by construction.
+            let mut want = std::cmp::min(ECJ_LOAD_CHUNK_BYTES as u64, end - off) as usize;
+            want -= want % NEEDLE_ID_SIZE;
+            if want == 0 {
+                break;
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
-                ecj_file.read_exact_at(&mut buf, off as u64)?;
+                ecj_file.read_exact_at(&mut buf[..want], off)?;
             }
             #[cfg(windows)]
             {
                 // Positional read so concurrent readers of the shared .ecj
                 // handle can't interleave seek/read. Mirrors the
                 // read_exact_at helper at the bottom of this file.
-                read_exact_at(ecj_file, &mut buf, off as u64)?;
+                read_exact_at(ecj_file, &mut buf[..want], off)?;
             }
             #[cfg(not(any(unix, windows)))]
             {
                 compile_error!("Platform not supported: only unix and windows are supported");
             }
-            set.insert(NeedleId::from_bytes(&buf));
-            off += NEEDLE_ID_SIZE as i64;
+            for entry in buf[..want].chunks_exact(NEEDLE_ID_SIZE) {
+                loaded.insert(NeedleId::from_bytes(entry));
+            }
+            off += want as u64;
         }
+
+        let mut set = self
+            .deleted_needles
+            .write()
+            .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?;
+        set.extend(loaded);
+        Ok(())
+    }
+
+    /// Rewrite a bloated `.ecj` from the set just loaded out of it.
+    ///
+    /// The journal is semantically a SET of deleted needle ids, but it is
+    /// written as an append-only log that nothing dedupes or truncates. Several
+    /// paths append a peer's *entire* journal onto this one —
+    /// `VolumeEcShardsCopy` (`copy_ecj_file`), EC index recovery, and
+    /// `ec_decode`'s deliberate merge across holders — so a volume whose shards
+    /// are repeatedly balanced between two servers grows the file geometrically.
+    /// Observed in production: 1.51 TB and 1.30 TB for one volume holding ~100
+    /// distinct ids, which wedged both owning volume servers at startup.
+    ///
+    /// Compaction is safe because the set IS the journal's meaning: every id in
+    /// the file is in the set, and no id is in the set that was not in the file
+    /// (this runs at mount, before any runtime delete). Crash-safe via temp
+    /// file + fsync + rename.
+    fn maybe_compact_ecj(&mut self) -> io::Result<()> {
+        let mut ids: Vec<NeedleId> = {
+            let set = self
+                .deleted_needles
+                .read()
+                .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?;
+            set.iter().copied().collect()
+        };
+        let compacted_len = (ids.len() * NEEDLE_ID_SIZE) as i64;
+
+        // Leave healthy journals alone: rewriting on every mount would churn
+        // the disk for no gain.
+        if self.ecj_file_size < ECJ_COMPACT_MIN_BYTES
+            || self.ecj_file_size < compacted_len.saturating_mul(ECJ_COMPACT_RATIO)
+        {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            volume_id = self.volume_id.0,
+            collection = %self.collection,
+            on_disk_bytes = self.ecj_file_size,
+            unique_ids = ids.len(),
+            compacted_bytes = compacted_len,
+            "compacting bloated .ecj deletion journal",
+        );
+
+        let ecj_path = format!("{}.ecj", self.idx_base_name());
+        let tmp_path = format!("{}.compact.tmp", ecj_path);
+
+        // Sorted so the rewritten file is deterministic: two holders that
+        // compact the same set produce byte-identical journals, which makes a
+        // difference between them meaningful rather than ordering noise.
+        ids.sort_unstable();
+        let mut out = vec![0u8; ids.len() * NEEDLE_ID_SIZE];
+        for (i, id) in ids.iter().enumerate() {
+            id.to_bytes(&mut out[i * NEEDLE_ID_SIZE..(i + 1) * NEEDLE_ID_SIZE]);
+        }
+
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(&out)?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, &ecj_path)?;
+
+        // The old handle now refers to the unlinked inode; reopen so later
+        // journal_delete appends land in the file we just wrote.
+        let reopened = open_volume_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .append(true),
+            &ecj_path,
+        )?;
+        self.ecj_file_size = reopened.metadata()?.len() as i64;
+        self.ecj_file = Some(reopened);
         Ok(())
     }
 
@@ -2356,6 +2482,172 @@ mod tests {
         vol.journal_delete(NeedleId(999)).unwrap();
         let (fc, dc) = vol.file_and_delete_count();
         assert_eq!((fc, dc), (2, 2));
+    }
+
+    /// Write a raw `.ecj` containing `ids` repeated `repeats` times, i.e. the
+    /// shape the append paths produce when a peer's whole journal is
+    /// concatenated onto this one over and over.
+    fn write_bloated_ecj(dir: &str, collection: &str, vid: VolumeId, ids: &[NeedleId], repeats: usize) {
+        let base = crate::storage::volume::volume_file_name(dir, collection, vid);
+        let mut one = vec![0u8; ids.len() * NEEDLE_ID_SIZE];
+        for (i, id) in ids.iter().enumerate() {
+            id.to_bytes(&mut one[i * NEEDLE_ID_SIZE..(i + 1) * NEEDLE_ID_SIZE]);
+        }
+        let mut f = File::create(format!("{}.ecj", base)).unwrap();
+        for _ in 0..repeats {
+            f.write_all(&one).unwrap();
+        }
+        f.sync_all().unwrap();
+    }
+
+    /// A journal that repeats a handful of ids until it is megabytes long must
+    /// mount to exactly those ids and be rewritten down to the set it encodes.
+    /// This is the production failure: 1.51 TB of ~100 distinct ids.
+    #[test]
+    fn test_bloated_ecj_is_compacted_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(dir, "", VolumeId(37), &[]);
+
+        // 100 unique ids x 4096 repeats x 8 B = 3.125 MiB on disk for 800 B of
+        // actual information — over both compaction thresholds.
+        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", VolumeId(37), &ids, 4096);
+
+        let ecj_path = format!(
+            "{}.ecj",
+            crate::storage::volume::volume_file_name(dir, "", VolumeId(37))
+        );
+        let before = std::fs::metadata(&ecj_path).unwrap().len();
+        assert_eq!(before, 100 * 4096 * NEEDLE_ID_SIZE as u64);
+
+        let vol = EcVolume::new(dir, dir, "", VolumeId(37)).unwrap();
+
+        // Every id survived, with no duplicates.
+        let deleted = vol.read_deleted_needles().unwrap();
+        assert_eq!(deleted, ids, "compaction must preserve the deleted set");
+
+        // And the file is now exactly the set.
+        let after = std::fs::metadata(&ecj_path).unwrap().len();
+        assert_eq!(
+            after,
+            ids.len() as u64 * NEEDLE_ID_SIZE as u64,
+            "journal should have been folded down to one entry per id",
+        );
+        assert!(after < before);
+
+        // No temp file left behind.
+        assert!(!std::path::Path::new(&format!("{}.compact.tmp", ecj_path)).exists());
+
+        // Remounting the compacted file yields the same set, and leaves it
+        // alone the second time.
+        drop(vol);
+        let vol2 = EcVolume::new(dir, dir, "", VolumeId(37)).unwrap();
+        assert_eq!(vol2.read_deleted_needles().unwrap(), ids);
+        assert_eq!(std::fs::metadata(&ecj_path).unwrap().len(), after);
+    }
+
+    /// Appends must still land in the file after a compaction reopened the
+    /// handle — otherwise deletes taken after mount would be lost on restart.
+    #[test]
+    fn test_journal_delete_after_compaction_persists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        // journal_delete only appends on a live->tombstone transition, so the
+        // needle must exist in .ecx.
+        write_ecx_file(
+            dir,
+            "",
+            VolumeId(38),
+            &[(NeedleId(7), Offset::from_actual_offset(8), Size(10))],
+        );
+        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", VolumeId(38), &ids, 4096);
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(38)).unwrap();
+        vol.journal_delete(NeedleId(7)).unwrap();
+        drop(vol);
+
+        let vol2 = EcVolume::new(dir, dir, "", VolumeId(38)).unwrap();
+        let deleted = vol2.read_deleted_needles().unwrap();
+        assert!(
+            deleted.contains(&NeedleId(7)),
+            "post-compaction append was lost across remount: {:?}",
+            &deleted[..deleted.len().min(5)],
+        );
+        assert_eq!(deleted.len(), ids.len() + 1);
+    }
+
+    /// A healthy journal must be left byte-for-byte alone — compaction is for
+    /// pathology, not routine churn on every mount.
+    #[test]
+    fn test_healthy_ecj_is_not_rewritten() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(dir, "", VolumeId(39), &[]);
+
+        // Duplicated 3x, but only 2.4 KB — under ECJ_COMPACT_MIN_BYTES.
+        let ids: Vec<NeedleId> = (1..=100).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", VolumeId(39), &ids, 3);
+
+        let ecj_path = format!(
+            "{}.ecj",
+            crate::storage::volume::volume_file_name(dir, "", VolumeId(39))
+        );
+        let before = std::fs::read(&ecj_path).unwrap();
+
+        let vol = EcVolume::new(dir, dir, "", VolumeId(39)).unwrap();
+
+        // The in-memory set is deduped; the on-disk journal is deliberately
+        // left as-is. `read_deleted_needles` reports raw file entries, so it
+        // still sees all three copies — that is the untouched-file assertion.
+        let (_, delete_count) = vol.file_and_delete_count();
+        assert_eq!(delete_count, ids.len() as u64);
+        assert_eq!(vol.read_deleted_needles().unwrap().len(), ids.len() * 3);
+
+        let after = std::fs::read(&ecj_path).unwrap();
+        assert_eq!(before, after, "small journal must not be rewritten");
+    }
+
+    /// A journal whose length is not a whole number of entries must not lose
+    /// the entries that ARE complete, and must not panic.
+    #[test]
+    fn test_ecj_with_trailing_partial_entry() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(dir, "", VolumeId(40), &[]);
+
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(40));
+        let ids: Vec<NeedleId> = (1..=3).map(NeedleId).collect();
+        let mut bytes = vec![0u8; ids.len() * NEEDLE_ID_SIZE];
+        for (i, id) in ids.iter().enumerate() {
+            id.to_bytes(&mut bytes[i * NEEDLE_ID_SIZE..(i + 1) * NEEDLE_ID_SIZE]);
+        }
+        bytes.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // torn tail
+        std::fs::write(format!("{}.ecj", base), &bytes).unwrap();
+
+        let vol = EcVolume::new(dir, dir, "", VolumeId(40)).unwrap();
+        assert_eq!(vol.read_deleted_needles().unwrap(), ids);
+    }
+
+    /// A journal spanning several read chunks must load every entry — guards
+    /// the chunk-boundary arithmetic in the buffered loader.
+    #[test]
+    fn test_ecj_spanning_multiple_read_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(dir, "", VolumeId(41), &[]);
+
+        // 2.5 chunks' worth of DISTINCT ids, so nothing is masked by dedup and
+        // the total is not a chunk multiple.
+        let n = (ECJ_LOAD_CHUNK_BYTES / NEEDLE_ID_SIZE) * 5 / 2;
+        let ids: Vec<NeedleId> = (1..=n as u64).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", VolumeId(41), &ids, 1);
+
+        let vol = EcVolume::new(dir, dir, "", VolumeId(41)).unwrap();
+        let deleted = vol.read_deleted_needles().unwrap();
+        assert_eq!(deleted.len(), n, "entries lost across a chunk boundary");
+        assert_eq!(deleted, ids);
     }
 
     #[test]
