@@ -850,6 +850,33 @@ impl EcVolume {
     /// (this runs at mount, before any runtime delete). Crash-safe via temp
     /// file + fsync + rename.
     fn maybe_compact_ecj(&mut self) -> io::Result<()> {
+        // Only compact a journal this instance solely owns.
+        //
+        // A store holds one EcVolume per disk location, and several of them can
+        // exist for the same volume id (`Store::find_all_ec_volumes_mut`). When
+        // `-dir.idx` points every disk at one index directory, all of those
+        // instances resolve `.ecx`/`.ecj` to the SAME path. Compaction replaces
+        // that path with a new inode and reopens only this instance's handle, so
+        // a sibling mounted earlier would go on appending to the unlinked inode:
+        // `find_ec_volume_mut` hands deletes to whichever holder it finds first,
+        // that holder acknowledges them, and they are gone at the next mount.
+        //
+        // The constructor cannot see its siblings, so be conservative rather than
+        // clever: compact only when the journal lives in this instance's own data
+        // directory, which by construction no other disk location shares. A
+        // server running a shared index directory therefore keeps an unbounded
+        // journal — worse than fixing it, better than losing acknowledged
+        // deletes — until replacement is coordinated across holders.
+        if self.ecx_actual_dir != self.dir {
+            tracing::debug!(
+                volume_id = self.volume_id.0,
+                ecx_dir = %self.ecx_actual_dir,
+                data_dir = %self.dir,
+                "skipping .ecj compaction: journal may be shared with another holder",
+            );
+            return Ok(());
+        }
+
         let mut ids: Vec<NeedleId> = {
             let set = self
                 .deleted_needles
@@ -931,6 +958,15 @@ impl EcVolume {
             )?);
             return Err(e);
         }
+
+        // Syncing the temp file persisted its contents, not the directory entry
+        // that now points at it. Without this a power loss can restore the old
+        // bloated journal — and, worse, discard deletes that were acknowledged
+        // against the replacement in between. Matches the other replace-by-rename
+        // paths in this crate (ec_decoder, volume_idx_rebuild, volume_idx_repair).
+        // Post-publication, so a failure is fatal for the same reason the reopen
+        // below is.
+        crate::storage::volume::fsync_dir(&ecj_path)?;
 
         // Past this point the journal HAS been replaced. Reopen so later
         // journal_delete appends land in the file we just wrote; if that fails,
@@ -2767,6 +2803,44 @@ mod tests {
             deleted,
         );
         assert_eq!(deleted.len(), ids.len() + 1, "misaligned decode: {:?}", deleted);
+    }
+
+    /// A journal reached through a shared index directory must be left alone:
+    /// another disk location may hold the same file open, and replacing the
+    /// inode under it would strand every delete that holder acknowledges.
+    #[test]
+    fn test_shared_index_dir_journal_is_not_compacted() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let idx_dir = tmp.path().join("idx");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&idx_dir).unwrap();
+        let (data, idx) = (
+            data_dir.to_str().unwrap(),
+            idx_dir.to_str().unwrap(),
+        );
+
+        // .ecx and .ecj live in the shared index dir, as with -dir.idx.
+        write_ecx_file(idx, "", VolumeId(44), &[]);
+        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
+        write_bloated_ecj(idx, "", VolumeId(44), &ids, 4096);
+
+        let ecj_path = format!(
+            "{}.ecj",
+            crate::storage::volume::volume_file_name(idx, "", VolumeId(44))
+        );
+        let before = std::fs::metadata(&ecj_path).unwrap().len();
+
+        let vol = EcVolume::new(data, idx, "", VolumeId(44)).unwrap();
+
+        // The set still loads correctly — only the rewrite is suppressed.
+        let (_, delete_count) = vol.file_and_delete_count();
+        assert_eq!(delete_count, ids.len() as u64);
+        assert_eq!(
+            std::fs::metadata(&ecj_path).unwrap().len(),
+            before,
+            "a journal in a shared index dir must not be replaced under a sibling holder",
+        );
     }
 
     /// Compaction must never leave the volume holding a handle that does not
