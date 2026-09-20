@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::sync::RwLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -519,16 +519,54 @@ impl EcVolume {
             &ecj_path,
         )?;
         vol.ecj_file_size = ecj_file.metadata()?.len() as i64;
+
+        // Repair a torn tail BEFORE anything can append to the journal.
+        //
+        // The file is a flat array of fixed-size records and the handle is in
+        // append mode, so every write lands at the physical end. A trailing
+        // partial record therefore knocks every later append out of alignment:
+        // the loader below skips the partial bytes, but the next mount decodes
+        // those bytes together with the leading bytes of a real entry, yielding
+        // one garbage id and silently dropping the delete that followed the
+        // tear. Truncating to a whole number of records costs at most one
+        // incomplete id that was never readable anyway.
+        let ragged = vol.ecj_file_size % NEEDLE_ID_SIZE as i64;
+        if ragged != 0 {
+            let whole = vol.ecj_file_size - ragged;
+            tracing::warn!(
+                volume_id = volume_id.0,
+                collection = %collection,
+                on_disk_bytes = vol.ecj_file_size,
+                truncated_to = whole,
+                "truncating torn .ecj tail so later appends stay aligned",
+            );
+            ecj_file.set_len(whole as u64)?;
+            ecj_file.sync_all()?;
+            vol.ecj_file_size = whole;
+        }
+
         vol.ecj_file = Some(ecj_file);
 
         // Seed the in-memory deleted set from the journal.
         vol.load_deleted_needles_from_ecj()?;
 
         // Then fold the journal back down to the set it encodes, if the append
-        // paths have bloated it. Non-fatal: a volume that cannot rewrite its
-        // journal (read-only disk, no space) must still mount and serve — the
-        // set is already correct in memory.
+        // paths have bloated it.
+        //
+        // A failure BEFORE the journal is replaced is non-fatal: nothing on disk
+        // changed and the in-memory set is already correct, so a volume on a
+        // read-only or full disk still mounts and serves. A failure AFTER it is
+        // replaced is not survivable that way — `maybe_compact_ecj` leaves
+        // `ecj_file` as None in that case, and continuing would let
+        // `journal_delete` append to nothing (or, worse, to an unlinked inode)
+        // while reporting success, so the deletes would vanish at the next mount.
         if let Err(e) = vol.maybe_compact_ecj() {
+            if vol.ecj_file.is_none() {
+                return Err(io::Error::other(format!(
+                    "ec volume {}: .ecj was compacted but could not be reopened: {}",
+                    volume_id.0, e
+                )));
+            }
             tracing::warn!(
                 volume_id = volume_id.0,
                 error = %e,
@@ -832,20 +870,59 @@ impl EcVolume {
         // compact the same set produce byte-identical journals, which makes a
         // difference between them meaningful rather than ordering noise.
         ids.sort_unstable();
-        let mut out = vec![0u8; ids.len() * NEEDLE_ID_SIZE];
-        for (i, id) in ids.iter().enumerate() {
-            id.to_bytes(&mut out[i * NEEDLE_ID_SIZE..(i + 1) * NEEDLE_ID_SIZE]);
+
+        // Stream the ids out rather than materialising the whole encoded
+        // journal: the set and the sorted vector are already resident, and a
+        // third full-size buffer is a needless contiguous allocation at mount.
+        let write_tmp = |path: &str, ids: &[NeedleId]| -> io::Result<()> {
+            let mut w = BufWriter::new(File::create(path)?);
+            let mut buf = [0u8; NEEDLE_ID_SIZE];
+            for id in ids {
+                id.to_bytes(&mut buf);
+                w.write_all(&buf)?;
+            }
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .sync_all()
+        };
+        if let Err(e) = write_tmp(&tmp_path, &ids) {
+            // Leaving the partial temp file behind would pin its bytes for the
+            // life of the process — and the likeliest reason to land here is
+            // ENOSPC, where those bytes are exactly what is scarce.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
         }
 
-        {
-            let mut tmp = File::create(&tmp_path)?;
-            tmp.write_all(&out)?;
-            tmp.sync_all()?;
-        }
-        fs::rename(&tmp_path, &ecj_path)?;
+        // Drop our handle on the destination BEFORE replacing it. On Windows a
+        // rename over a file that is still open fails outright, which would
+        // make compaction a permanent no-op there; on Unix the handle would
+        // survive as an unlinked inode, which is worse than useless. From here
+        // until the reopen below, `ecj_file` is None on purpose: that is the
+        // signal `new()` uses to tell "nothing was published" from "the journal
+        // was replaced and we have no handle to it".
+        self.ecj_file = None;
 
-        // The old handle now refers to the unlinked inode; reopen so later
-        // journal_delete appends land in the file we just wrote.
+        if let Err(e) = fs::rename(&tmp_path, &ecj_path) {
+            let _ = fs::remove_file(&tmp_path);
+            // Nothing was published — the original journal is still in place, so
+            // restore a working handle and let the caller treat this as
+            // non-fatal.
+            self.ecj_file = Some(open_volume_file(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .append(true),
+                &ecj_path,
+            )?);
+            return Err(e);
+        }
+
+        // Past this point the journal HAS been replaced. Reopen so later
+        // journal_delete appends land in the file we just wrote; if that fails,
+        // `ecj_file` stays None and `new()` turns it into a mount failure rather
+        // than a volume that silently drops deletes.
         let reopened = open_volume_file(
             OpenOptions::new()
                 .read(true)
@@ -2628,6 +2705,90 @@ mod tests {
 
         let vol = EcVolume::new(dir, dir, "", VolumeId(40)).unwrap();
         assert_eq!(vol.read_deleted_needles().unwrap(), ids);
+    }
+
+    /// A torn tail must be truncated at mount, not merely skipped. The handle
+    /// is in append mode, so leaving the partial bytes in place would push
+    /// every later append out of alignment: the delete taken after the tear
+    /// would decode as garbage on the next mount and be silently lost.
+    #[test]
+    fn test_torn_ecj_tail_is_repaired_so_later_deletes_survive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        // journal_delete only appends on a live->tombstone transition.
+        write_ecx_file(
+            dir,
+            "",
+            VolumeId(42),
+            &[(NeedleId(7), Offset::from_actual_offset(8), Size(10))],
+        );
+
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(42));
+        let ecj_path = format!("{}.ecj", base);
+        let ids: Vec<NeedleId> = (1..=3).map(NeedleId).collect();
+        let mut bytes = vec![0u8; ids.len() * NEEDLE_ID_SIZE];
+        for (i, id) in ids.iter().enumerate() {
+            id.to_bytes(&mut bytes[i * NEEDLE_ID_SIZE..(i + 1) * NEEDLE_ID_SIZE]);
+        }
+        bytes.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // torn tail
+        std::fs::write(&ecj_path, &bytes).unwrap();
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(42)).unwrap();
+
+        // The tear is gone from disk, not just ignored in memory.
+        assert_eq!(
+            std::fs::metadata(&ecj_path).unwrap().len(),
+            (ids.len() * NEEDLE_ID_SIZE) as u64,
+            "torn tail should have been truncated at mount",
+        );
+
+        vol.journal_delete(NeedleId(7)).unwrap();
+        drop(vol);
+
+        // The delete taken after the repair must survive a remount.
+        let vol2 = EcVolume::new(dir, dir, "", VolumeId(42)).unwrap();
+        let deleted = vol2.read_deleted_needles().unwrap();
+        assert!(
+            deleted.contains(&NeedleId(7)),
+            "delete after a torn tail was lost: {:?}",
+            deleted,
+        );
+        assert_eq!(deleted.len(), ids.len() + 1, "misaligned decode: {:?}", deleted);
+    }
+
+    /// Compaction must never leave the volume holding a handle that does not
+    /// refer to the journal's pathname, and must not leave its temp file behind.
+    #[test]
+    fn test_compaction_leaves_a_usable_handle_and_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(
+            dir,
+            "",
+            VolumeId(43),
+            &[(NeedleId(7), Offset::from_actual_offset(8), Size(10))],
+        );
+        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", VolumeId(43), &ids, 4096);
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(43)).unwrap();
+        assert!(vol.ecj_file.is_some(), "mount must leave a journal handle");
+
+        let ecj_path = format!(
+            "{}.ecj",
+            crate::storage::volume::volume_file_name(dir, "", VolumeId(43))
+        );
+        assert!(!std::path::Path::new(&format!("{}.compact.tmp", ecj_path)).exists());
+
+        // The handle must point at the pathname, not at a replaced inode: a
+        // delete has to be visible to a fresh reader of the file.
+        vol.journal_delete(NeedleId(7)).unwrap();
+        let on_disk = std::fs::metadata(&ecj_path).unwrap().len();
+        assert_eq!(
+            on_disk,
+            ((ids.len() + 1) * NEEDLE_ID_SIZE) as u64,
+            "post-compaction append did not reach the journal's pathname",
+        );
     }
 
     /// A journal spanning several read chunks must load every entry — guards
