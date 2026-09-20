@@ -249,6 +249,16 @@ func (t *Topology) tryPlace(vk volKey, need []int, dataShards, parityShards int,
 		numEligibleRacks = 1
 	}
 
+	// FORK (patches/0001 companion): non-relaxable cap on TOTAL (data+parity)
+	// shards per rack. Upstream caps each shard TYPE independently, which on a
+	// topology where one rack == one physical spindle permits e.g. 2 data + 1
+	// parity on a single disk; losing 2 disks then strands >parityShards shards
+	// and a 10+4 volume becomes unreadable. Never relaxed, by design.
+	maxTotalPerRack := ceilDivide(dataShards+parityShards, numEligibleRacks)
+	if maxTotalPerRack < 1 {
+		maxTotalPerRack = 1
+	}
+
 	attempts := strictAttempts
 	if mode == PlaceDurabilityFirst {
 		attempts = durabilityAttempts
@@ -264,7 +274,7 @@ func (t *Topology) tryPlace(vk volKey, need []int, dataShards, parityShards int,
 			typeTotal = parityShards
 		}
 		for _, rl := range attempts {
-			node, diskID, spilled, ok := chooseShardDest(vk, sid, isData, dataShards, typeTotal, numEligibleRacks, parityShards, racks, rackKeys, rp, eligible, prefer, shardsPerRack[isData], rackShardCount, bearing, rl)
+			node, diskID, spilled, ok := chooseShardDest(vk, sid, isData, dataShards, typeTotal, numEligibleRacks, parityShards, maxTotalPerRack, racks, rackKeys, rp, eligible, prefer, shardsPerRack[isData], rackShardCount, bearing, rl)
 			if !ok {
 				continue
 			}
@@ -320,7 +330,7 @@ func (t *Topology) tryPlace(vk volKey, need []int, dataShards, parityShards int,
 // anti-affinity to the opposite type), then the least-loaded eligible node, then
 // the best eligible disk. The third return reports whether the disk spilled off
 // the soft-preferred type. ok=false when no rack/node/disk fits.
-func chooseShardDest(vk volKey, sid int, isData bool, dataShards, typeTotal, numEligibleRacks, maxPerDisk int, racks map[string]*rack, rackKeys []string, rp *super_block.ReplicaPlacement, eligible func(*disk) bool, prefer func(*disk) bool, shardsPerRackType map[string][]int, rackShardCount map[string]int, bearing map[bool]map[string]bool, rl relaxation) (*Node, uint32, bool, bool) {
+func chooseShardDest(vk volKey, sid int, isData bool, dataShards, typeTotal, numEligibleRacks, maxPerDisk, maxTotalPerRack int, racks map[string]*rack, rackKeys []string, rp *super_block.ReplicaPlacement, eligible func(*disk) bool, prefer func(*disk) bool, shardsPerRackType map[string][]int, rackShardCount map[string]int, bearing map[bool]map[string]bool, rl relaxation) (*Node, uint32, bool, bool) {
 	maxPerRack := numEligibleRacks*typeTotal + 1 // effectively unlimited when caps are relaxed
 	if rl.caps {
 		if maxPerRack = ceilDivide(typeTotal, numEligibleRacks); maxPerRack < 1 {
@@ -339,6 +349,13 @@ func chooseShardDest(vk volKey, sid int, isData bool, dataShards, typeTotal, num
 	// A rack is eligible only if it is under the per-rack shard cap (DiffRackCount),
 	// enforced only when set (and relaxed with rp).
 	withinLimit := func(r string) bool {
+		// FORK: total-per-rack durability cap. Deliberately checked BEFORE the
+		// rp guard and outside every relaxation level, so it holds even when
+		// ReplicaPlacement is nil (our `000` replication) and even under
+		// PlaceDurabilityFirst.
+		if maxTotalPerRack > 0 && rackShardCount[r] >= maxTotalPerRack {
+			return false
+		}
 		if rp == nil {
 			return true
 		}
