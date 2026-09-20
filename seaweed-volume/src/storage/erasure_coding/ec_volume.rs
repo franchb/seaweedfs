@@ -510,6 +510,45 @@ impl EcVolume {
         let ecj_base =
             crate::storage::volume::volume_file_name(&vol.ecx_actual_dir, collection, volume_id);
         let ecj_path = format!("{}.ecj", ecj_base);
+
+        // Repair a torn tail BEFORE the append handle exists.
+        //
+        // The file is a flat array of fixed-size records and the journal handle
+        // is in append mode, so every write lands at the physical end. A
+        // trailing partial record therefore knocks every later append out of
+        // alignment: the loader below skips the partial bytes, but the next
+        // mount decodes those bytes together with the leading bytes of a real
+        // entry, yielding one garbage id and silently dropping the delete that
+        // followed the tear. Truncating to a whole number of records costs at
+        // most one incomplete id that was never readable anyway.
+        //
+        // This deliberately uses its own read+write handle rather than the
+        // append handle opened below: on Windows, `append(true)` requests
+        // FILE_APPEND_DATA *without* FILE_WRITE_DATA (and `.write(true)` is
+        // subsumed by `.append(true)`), so SetEndOfFile through that handle
+        // fails with ERROR_ACCESS_DENIED. The handle is scoped so it is closed
+        // again before the append handle opens.
+        {
+            let repair = open_volume_file(
+                OpenOptions::new().read(true).write(true).create(true),
+                &ecj_path,
+            )?;
+            let on_disk = repair.metadata()?.len() as i64;
+            let ragged = on_disk % NEEDLE_ID_SIZE as i64;
+            if ragged != 0 {
+                let whole = on_disk - ragged;
+                tracing::warn!(
+                    volume_id = volume_id.0,
+                    collection = %collection,
+                    on_disk_bytes = on_disk,
+                    truncated_to = whole,
+                    "truncating torn .ecj tail so later appends stay aligned",
+                );
+                repair.set_len(whole as u64)?;
+                repair.sync_all()?;
+            }
+        }
+
         let ecj_file = open_volume_file(
             OpenOptions::new()
                 .read(true)
@@ -519,32 +558,6 @@ impl EcVolume {
             &ecj_path,
         )?;
         vol.ecj_file_size = ecj_file.metadata()?.len() as i64;
-
-        // Repair a torn tail BEFORE anything can append to the journal.
-        //
-        // The file is a flat array of fixed-size records and the handle is in
-        // append mode, so every write lands at the physical end. A trailing
-        // partial record therefore knocks every later append out of alignment:
-        // the loader below skips the partial bytes, but the next mount decodes
-        // those bytes together with the leading bytes of a real entry, yielding
-        // one garbage id and silently dropping the delete that followed the
-        // tear. Truncating to a whole number of records costs at most one
-        // incomplete id that was never readable anyway.
-        let ragged = vol.ecj_file_size % NEEDLE_ID_SIZE as i64;
-        if ragged != 0 {
-            let whole = vol.ecj_file_size - ragged;
-            tracing::warn!(
-                volume_id = volume_id.0,
-                collection = %collection,
-                on_disk_bytes = vol.ecj_file_size,
-                truncated_to = whole,
-                "truncating torn .ecj tail so later appends stay aligned",
-            );
-            ecj_file.set_len(whole as u64)?;
-            ecj_file.sync_all()?;
-            vol.ecj_file_size = whole;
-        }
-
         vol.ecj_file = Some(ecj_file);
 
         // Seed the in-memory deleted set from the journal.
