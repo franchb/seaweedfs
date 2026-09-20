@@ -359,11 +359,21 @@ func detectCrossRackImbalance(vk volKey, nodes map[string]*Node, racks map[strin
 	}
 
 	rackShardCount := countShardsByRack(vk, nodes)
+	// totalCap bounds the TOTAL (data+parity) shards a single rack may hold so a
+	// rack maps to one physical disk and a 2-disk loss strands <=4 shards. Derived
+	// from the volume's resolved data+parity (not hard-coded 14) to stay correct for
+	// custom-ratio volumes. Applied only in the parity pass, where rackShardCount
+	// reflects post-data-pass totals (rackShardCount is live-updated per move).
+	totalCap := ceilDivide(dataShards+parityShards, numRacks)
 	var moves []*move
 
+	// Data pass: totalCap is disabled (0). The per-type data cap
+	// ceilDivide(dataShards, numRacks) <= totalCap already keeps data within the
+	// total bound, and rackShardCount still includes parity the parity pass will
+	// shed, so applying the total cap here would mis-shed data that actually fits.
 	dataPerRack, _ := shardsByGroup(vk, nodes, dataShards, func(n *Node) string { return n.rack })
 	moves = append(moves, balanceShardTypeAcrossRacks(vk, nodes, racks, diskType, dataShards,
-		dataPerRack, rackShardCount, ceilDivide(dataShards, numRacks), nil, rp)...)
+		dataPerRack, rackShardCount, ceilDivide(dataShards, numRacks), 0, nil, rp)...)
 
 	dataPerRack, parityPerRack := shardsByGroup(vk, nodes, dataShards, func(n *Node) string { return n.rack })
 	antiAffinity := make(map[string]bool)
@@ -373,12 +383,12 @@ func detectCrossRackImbalance(vk volKey, nodes map[string]*Node, racks map[strin
 		}
 	}
 	moves = append(moves, balanceShardTypeAcrossRacks(vk, nodes, racks, diskType, dataShards,
-		parityPerRack, rackShardCount, ceilDivide(parityShards, numRacks), antiAffinity, rp)...)
+		parityPerRack, rackShardCount, ceilDivide(parityShards, numRacks), totalCap, antiAffinity, rp)...)
 
 	return moves
 }
 
-func balanceShardTypeAcrossRacks(vk volKey, nodes map[string]*Node, racks map[string]*rack, diskType string, dataShards int, shardsPerRack map[string][]int, rackShardCount map[string]int, maxPerRack int, antiAffinity map[string]bool, rp *super_block.ReplicaPlacement) []*move {
+func balanceShardTypeAcrossRacks(vk volKey, nodes map[string]*Node, racks map[string]*rack, diskType string, dataShards int, shardsPerRack map[string][]int, rackShardCount map[string]int, maxPerRack, totalCap int, antiAffinity map[string]bool, rp *super_block.ReplicaPlacement) []*move {
 	if maxPerRack < 1 {
 		maxPerRack = 1
 	}
@@ -391,30 +401,56 @@ func balanceShardTypeAcrossRacks(vk volKey, nodes map[string]*Node, racks map[st
 	var toMove []pending
 	for _, rackID := range rackKeys {
 		shards := append([]int(nil), shardsPerRack[rackID]...)
-		if len(shards) <= maxPerRack {
+		// Shed enough to satisfy BOTH caps: the per-type cap and the TOTAL cap
+		// (the latter only when enabled, i.e. the parity pass). A rack already at
+		// its total quota (e.g. 2 data after the data pass) must shed ALL of this
+		// type even though the per-type cap alone would let it keep maxPerRack.
+		// Clamp to len(shards): we can only shed shards of this type on the rack.
+		shed := len(shards) - maxPerRack
+		if totalCap > 0 {
+			if t := rackShardCount[rackID] - totalCap; t > shed {
+				shed = t
+			}
+		}
+		if shed <= 0 {
 			continue
 		}
+		if shed > len(shards) {
+			shed = len(shards)
+		}
 		sort.Ints(shards)
-		for i := 0; i < len(shards)-maxPerRack; i++ {
+		for i := 0; i < shed; i++ {
 			if src := nodeInRackHoldingShard(nodes, rackID, vk, shards[i]); src != nil {
 				toMove = append(toMove, pending{shards[i], src})
 			}
 		}
 	}
 
+	hasFree := func(r string) bool { return racks[r].freeSlots > 0 }
+	withinLimit := func(r string) bool {
+		// Reject any rack already at the TOTAL cap (parity pass only) so
+		// shed shards never pile onto a full disk. Independent of rp,
+		// which is nil in the per-disk-cap tests.
+		if totalCap > 0 && rackShardCount[r] >= totalCap {
+			return false
+		}
+		if rp != nil && rp.DiffRackCount > 0 && rackShardCount[r] >= rp.DiffRackCount {
+			return false
+		}
+		return true
+	}
+
 	var moves []*move
 	for _, pm := range toMove {
-		destRack, ok := pickTarget(rackKeys, shardsPerRack, maxPerRack, antiAffinity,
-			func(r string) bool { return racks[r].freeSlots > 0 },
-			func(r string) bool {
-				if rp == nil {
-					return true
-				}
-				if rp.DiffRackCount > 0 && rackShardCount[r] >= rp.DiffRackCount {
-					return false
-				}
-				return true
-			})
+		destRack, ok := pickTarget(rackKeys, shardsPerRack, maxPerRack, antiAffinity, hasFree, withinLimit)
+		if !ok && totalCap > 0 {
+			// No rack is under the per-type evenness cap. Relax it up to the HARD total
+			// cap: a shard must not strand on an over-cap rack while total-cap room exists
+			// elsewhere. withinLimit still enforces totalCap (the durability limit) and
+			// hasFree still applies; pickTarget's own two-tier keeps anti-affinity a
+			// PREFERENCE, not a gate, in this fallback.
+			destRack, ok = pickTarget(rackKeys, shardsPerRack, totalCap, antiAffinity, hasFree, withinLimit)
+		}
 		if !ok {
 			continue
 		}
