@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/storage/volume_info"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -30,6 +32,15 @@ var (
 // from .ecj. A multiple of NeedleIdSize; 1 MiB is 131072 entries per syscall,
 // which keeps a bloated journal from spending mount in per-entry reads.
 const ecjLoadChunkBytes = 1 << 20
+
+// A .ecj smaller than this is never rewritten, however redundant. Below a
+// megabyte the duplication costs nothing and the rewrite is pure churn.
+const ecjCompactMinBytes = 1 << 20
+
+// Rewrite only when the journal is at least this many times larger than the
+// set it encodes. A journal legitimately holds one entry per delete, so some
+// slack is normal; an order of magnitude is not.
+const ecjCompactRatio = 4
 
 type EcVolume struct {
 	VolumeId                  needle.VolumeId
@@ -229,6 +240,17 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	ev.deletedNeedles = make(map[types.NeedleId]struct{})
 	if loadErr := ev.loadDeletedNeedlesFromEcj(); loadErr != nil {
 		glog.Warningf("ec volume %d: load deleted needles from .ecj: %v", vid, loadErr)
+	}
+	// Fold a bloated journal back down to the set it encodes. A failure
+	// before the journal is replaced is non-fatal (the set is already correct
+	// in memory); a failure after it leaves ecjFile nil and must fail the
+	// mount, otherwise later deletes would vanish into an unlinked inode.
+	if compactErr := ev.maybeCompactEcj(indexBaseFileName); compactErr != nil {
+		if ev.ecjFile == nil {
+			ev.Close()
+			return nil, fmt.Errorf("ec volume %d: .ecj was compacted but could not be reopened: %w", vid, compactErr)
+		}
+		glog.Warningf("ec volume %d: compact .ecj: %v", vid, compactErr)
 	}
 
 	// read volume info. Prefer .vif at the data dir (where shards live), but
@@ -670,6 +692,122 @@ func (ev *EcVolume) loadDeletedNeedlesFromEcj() error {
 		}
 		off += want
 	}
+	return nil
+}
+
+// ecjCompactionPlan decides whether the journal needs compaction, returning the
+// sorted id set to rewrite when it does. Trigger: file_records >
+// max(threshold_records, k * distinct_ids) with a 1 MiB floor so a small
+// healthy journal is never rewritten.
+func (ev *EcVolume) ecjCompactionPlan() ([]types.NeedleId, bool) {
+	// Only compact a journal this instance solely owns. With -dir.idx shared,
+	// several EcVolume instances resolve .ecj to the same path; replacing the
+	// inode under a sibling holder would strand its acknowledged deletes.
+	if ev.ecxActualDir != ev.dir {
+		glog.V(1).Infof("ec volume %d: skipping .ecj compaction: journal may be shared with another holder (ecx=%s dir=%s)", ev.VolumeId, ev.ecxActualDir, ev.dir)
+		return nil, false
+	}
+	ev.deletedNeedlesLock.RLock()
+	ids := make([]types.NeedleId, 0, len(ev.deletedNeedles))
+	for id := range ev.deletedNeedles {
+		ids = append(ids, id)
+	}
+	ev.deletedNeedlesLock.RUnlock()
+	compactedLen := int64(len(ids) * types.NeedleIdSize)
+	if ev.ecjFileSize < int64(ecjCompactMinBytes) || ev.ecjFileSize < compactedLen*int64(ecjCompactRatio) {
+		return nil, false
+	}
+	slices.Sort(ids)
+	glog.Warningf("ec volume %d: compacting bloated .ecj deletion journal on-disk=%d unique=%d compacted=%d", ev.VolumeId, ev.ecjFileSize, len(ids), compactedLen)
+	return ids, true
+}
+
+// writeCompactedEcjTmp streams sorted ids to tmpPath and fsyncs it. Extracted
+// so ENOSPC / read-only-dir failures are unit-testable.
+func writeCompactedEcjTmp(tmpPath string, ids []types.NeedleId) error {
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	var rec [types.NeedleIdSize]byte
+	for _, id := range ids {
+		types.NeedleIdToBytes(rec[:], id)
+		if _, err := f.Write(rec[:]); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// maybeCompactEcj folds a bloated journal back down to the set it encodes.
+func (ev *EcVolume) maybeCompactEcj(indexBaseFileName string) error {
+	ids, ok := ev.ecjCompactionPlan()
+	if !ok {
+		return nil
+	}
+	ecjPath := indexBaseFileName + ".ecj"
+	tmpPath := ecjPath + ".compact.tmp"
+	if err := writeCompactedEcjTmp(tmpPath, ids); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return ev.publishCompactedEcj(ecjPath, tmpPath)
+}
+
+// publishCompactedEcj replaces the live journal with the compacted tmp file.
+func (ev *EcVolume) publishCompactedEcj(ecjPath, tmpPath string) error {
+	return ev.publishCompactedEcjWith(ecjPath, tmpPath, os.Rename,
+		func(p string) error { return util.FsyncDir(filepath.Dir(p)) },
+		func(p string) (*os.File, error) {
+			return backend.OpenVolumeFile(p, os.O_RDWR|os.O_CREATE)
+		})
+}
+
+// publishCompactedEcjWith is the testable core with injectable rename/fsync/
+// reopen, so failure paths are covered without real disk faults.
+func (ev *EcVolume) publishCompactedEcjWith(ecjPath, tmpPath string, rename func(string, string) error, fsyncDir func(string) error, reopen func(string) (*os.File, error)) error {
+	// Drop the handle before replacing: on Windows a rename over an open file
+	// fails, and on Unix the old handle would survive as an unlinked inode.
+	// From here until reopen, ecjFile is nil on purpose — the signal NewEcVolume
+	// uses to tell "nothing was published" from "replaced without a handle".
+	if ev.ecjFile != nil {
+		_ = ev.ecjFile.Close()
+		ev.ecjFile = nil
+	}
+	if err := rename(tmpPath, ecjPath); err != nil {
+		_ = os.Remove(tmpPath)
+		reopened, reopenErr := reopen(ecjPath)
+		if reopenErr != nil {
+			return errors.Join(err, reopenErr)
+		}
+		ev.ecjFile = reopened
+		if fi, statErr := reopened.Stat(); statErr == nil {
+			ev.ecjFileSize = fi.Size()
+		}
+		return err
+	}
+	// The tmp sync persisted contents, not the directory entry. Without this a
+	// power loss can restore the old journal and discard deletes acknowledged
+	// against the replacement.
+	if err := fsyncDir(ecjPath); err != nil {
+		return err
+	}
+	reopened, err := reopen(ecjPath)
+	if err != nil {
+		return err
+	}
+	if fi, statErr := reopened.Stat(); statErr != nil {
+		_ = reopened.Close()
+		return statErr
+	} else {
+		ev.ecjFileSize = fi.Size()
+	}
+	ev.ecjFile = reopened
 	return nil
 }
 
