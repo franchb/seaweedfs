@@ -47,6 +47,7 @@ use crate::server::grpc_client::{
 };
 use crate::server::volume_server::{VolumeServerState, to_http_address};
 use crate::storage::erasure_coding::ec_shard::{ShardId, shard_id_try_from};
+use crate::storage::erasure_coding::ecj_merge::{merge_ecj_union, read_ecj_ids};
 use crate::storage::needle::needle::{Needle, NeedleError, get_actual_size};
 use crate::storage::store_ec_reconcile::EcVolumeMissingIndex;
 use crate::storage::types::*;
@@ -1733,15 +1734,18 @@ async fn fetch_ec_index_from_one_peer(
         )));
     }
 
-    // .ecj is the source peer's deletion journal (appended); .vif carries EC
-    // params. Both are best-effort: a missing .ecj is recreated at mount and a
-    // missing .vif falls back to default EC parameters. A failed .ecj append
-    // leaves a partial file, so drop it.
+    // .ecj is the source peer's deletion journal; .vif carries EC params. Both
+    // are best-effort: a missing .ecj is recreated at mount and a missing .vif
+    // falls back to default EC parameters. The journal is a *set*: merge the
+    // peer's ids with any local ones (dedup union, #13) instead of appending,
+    // so a volume bounced between servers cannot double its journal.
+    // Failures leave the local journal untouched.
     match client.copy_file(copy_req(".ecj", true)).await {
         Ok(resp) => {
-            if let Err(e) = drain_copy_stream(resp.into_inner(), ecj_path, true).await {
+            if let Err(e) =
+                commit_recovered_ecj(state, m, peer, resp.into_inner(), ecj_path).await
+            {
                 tracing::warn!(volume_id = m.vid.0, peer = %peer, "copy .ecj: {}", e);
-                let _ = fs::remove_file(ecj_path);
             }
         }
         Err(e) => tracing::warn!(volume_id = m.vid.0, peer = %peer, "copy .ecj: {}", e),
@@ -1756,6 +1760,44 @@ async fn fetch_ec_index_from_one_peer(
         Err(e) => tracing::warn!(volume_id = m.vid.0, peer = %peer, "copy .vif: {}", e),
     }
 
+    Ok(())
+}
+
+/// Merge a staged recovery `.ecj` with the local journal as a deduped union.
+/// Missing source (empty stream, ts 0) keeps the local journal. Failures
+/// leave the local journal untouched. Adopted into memory if mounted.
+async fn commit_recovered_ecj(
+    state: &Arc<VolumeServerState>,
+    m: &EcVolumeMissingIndex,
+    peer: &str,
+    stream: tonic::Streaming<crate::pb::volume_server_pb::CopyFileResponse>,
+    ecj_path: &str,
+) -> io::Result<()> {
+    let incoming_path = format!("{}.incoming", ecj_path);
+    let (written, modified_ts_ns) =
+        drain_copy_stream_to_temp(stream, &incoming_path)
+            .await
+            .map_err(|e| {
+                let _ = fs::remove_file(&incoming_path);
+                e
+            })?;
+    if modified_ts_ns == 0 && written == 0 {
+        let _ = fs::remove_file(&incoming_path);
+        return Ok(());
+    }
+    let merge_result = merge_ecj_union(ecj_path, &incoming_path, ecj_path);
+    let _ = fs::remove_file(&incoming_path);
+    merge_result?;
+    if let Ok(merged) = read_ecj_ids(ecj_path) {
+        let mut store = state.store.write().unwrap();
+        for ecv in store.find_all_ec_volumes_mut(m.vid) {
+            if ecv.ecj_file_name() == ecj_path
+                && let Err(e) = ecv.adopt_merged_ecj(&merged)
+            {
+                tracing::warn!(volume_id = m.vid.0, peer = %peer, "adopt merged .ecj: {}", e);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1784,6 +1826,45 @@ async fn drain_copy_stream(
             .map_err(|e| io::Error::other(format!("write {}: {}", dest_path, e)))?;
     }
     Ok(())
+}
+
+/// Drain a CopyFile stream for `.ecj` into a temp sibling, tracking the
+/// source's `modified_ts_ns` so a missing source (empty stream, ts 0) is
+/// distinguishable from a genuinely empty journal. Returns
+/// `(bytes_written, modified_ts_ns)`. Failures remove the temp.
+async fn drain_copy_stream_to_temp(
+    mut stream: tonic::Streaming<crate::pb::volume_server_pb::CopyFileResponse>,
+    temp_path: &str,
+) -> io::Result<(u64, i64)> {
+    use std::io::Write;
+    let mut file = fs::File::create(temp_path)
+        .map_err(|e| io::Error::other(format!("create {}: {}", temp_path, e)))?;
+    let mut written: u64 = 0;
+    let mut modified_ts_ns: i64 = 0;
+    let result = async {
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|e| io::Error::other(format!("recv {}: {}", temp_path, e)))?
+        {
+            if chunk.modified_ts_ns != 0 {
+                modified_ts_ns = chunk.modified_ts_ns;
+            }
+            file.write_all(&chunk.file_content)
+                .map_err(|e| io::Error::other(format!("write {}: {}", temp_path, e)))?;
+            written += chunk.file_content.len() as u64;
+        }
+        Ok::<(u64, i64), io::Error>((written, modified_ts_ns))
+    }
+    .await;
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            drop(file);
+            let _ = fs::remove_file(temp_path);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

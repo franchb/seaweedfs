@@ -1836,6 +1836,29 @@ impl EcVolume {
         Ok(needles)
     }
 
+    /// Adopt a merged `.ecj` that replaced this volume's journal on disk
+    /// (copy/recover dedup union). Extends the in-memory set with the merged
+    /// ids and reopens the append handle on the new inode so later deletes
+    /// land in the live file, never an unlinked one. Call after the atomic
+    /// rename has published `ecj_file_name()`.
+    pub fn adopt_merged_ecj(&mut self, merged: &HashSet<NeedleId>) -> io::Result<()> {
+        if let Ok(mut set) = self.deleted_needles.write() {
+            set.extend(merged.iter().copied());
+        }
+        let ecj_path = self.ecj_file_name();
+        let reopened = open_volume_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .append(true),
+            &ecj_path,
+        )?;
+        self.ecj_file_size = reopened.metadata()?.len() as i64;
+        self.ecj_file = Some(reopened);
+        Ok(())
+    }
+
     // ---- Lifecycle ----
 
     pub fn close(&mut self) {

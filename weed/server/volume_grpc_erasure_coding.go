@@ -437,8 +437,12 @@ func (vs *VolumeServer) VolumeEcShardsCopy(ctx context.Context, req *volume_serv
 		}
 
 		if req.CopyEcjFile {
-			// copy ecj file
-			if _, err := vs.doCopyFileWithThrottler(client, true, req.Collection, req.VolumeId, math.MaxUint32, math.MaxInt64, indexBaseFileName, ".ecj", true, true, nil, throttler); err != nil {
+			// The journal is a *set* of ids: the destination must end up as
+			// the deduplicated union (local ∪ source), not the concatenation,
+			// or every balance round trip doubles the file (#13). Stage the
+			// source into a temp sibling, then merge + atomic rename. A
+			// missing source is not an error.
+			if err := vs.copyEcjAndMerge(client, req.Collection, req.VolumeId, indexBaseFileName, throttler); err != nil {
 				return err
 			}
 		}
@@ -467,6 +471,46 @@ func (vs *VolumeServer) VolumeEcShardsCopy(ctx context.Context, req *volume_serv
 	}
 
 	return &volume_server_pb.VolumeEcShardsCopyResponse{}, nil
+}
+
+// copyEcjAndMerge stages the source peer's .ecj into a temp sibling and merges
+// it with the local journal as a deduplicated union (sorted, #13). A missing
+// source (modifiedTsNs == 0) leaves the destination untouched and is not an
+// error. After the atomic rename, any mounted volume for vid that owns
+// destBase.ecj adopts the merged set and reopens its handle so later deletes
+// land in the live file.
+func (vs *VolumeServer) copyEcjAndMerge(client volume_server_pb.VolumeServerClient, collection string, vid uint32, destBase string, throttler *util.WriteThrottler) error {
+	destPath := destBase + ".ecj"
+	tempBase := destBase + ".merge"
+	tempPath := tempBase + ".ecj"
+	modifiedTsNs, err := vs.doCopyFileWithThrottler(client, true, collection, vid, math.MaxUint32, math.MaxInt64, tempBase, ".ecj", false, true, nil, throttler)
+	if err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("VolumeEcShardsCopy volume %d: copy .ecj: %w", vid, err)
+	}
+	if modifiedTsNs == 0 {
+		// Source has no .ecj: writeToFile already removed the staged temp;
+		// keep whatever is local. Remove defensively in case of drift.
+		os.Remove(tempPath)
+		return nil
+	}
+	if _, err := erasure_coding.MergeEcjUnion(destPath, tempPath, destPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("VolumeEcShardsCopy volume %d: merge .ecj %s: %w", vid, destPath, err)
+	}
+	os.Remove(tempPath)
+	merged, err := erasure_coding.ReadEcjIds(destPath)
+	if err != nil {
+		return fmt.Errorf("VolumeEcShardsCopy volume %d: read merged .ecj %s: %w", vid, destPath, err)
+	}
+	for _, loc := range vs.store.Locations {
+		if ev, found := loc.FindEcVolume(needle.VolumeId(vid)); found && ev.FileName(".ecj") == destPath {
+			if err := ev.AdoptMergedEcj(merged); err != nil {
+				glog.Warningf("VolumeEcShardsCopy volume %d: adopt merged .ecj: %v", vid, err)
+			}
+		}
+	}
+	return nil
 }
 
 // VolumeEcShardsDelete local delete the .ecx and some ec data slices if not needed
