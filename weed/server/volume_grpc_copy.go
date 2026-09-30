@@ -408,6 +408,38 @@ func findLastAppendAtNsFromCopiedFiles(idxFileName, datFileName string, version 
 	return util.BytesToUint64(tail[needle.NeedleChecksumSize : needle.NeedleChecksumSize+types.TimestampSize]), nil
 }
 
+// mergeEcjFileFromPeer fetches the source's .ecj into a staging file and folds
+// it into the local journal as a set union (erasure_coding.MergeEcjFile). A
+// raw append of the peer's whole journal never dedupes, so shards moving back
+// and forth between servers grew journals geometrically. A source without a
+// journal is a no-op, and a failed copy leaves the local journal untouched.
+func (vs *VolumeServer) mergeEcjFileFromPeer(client volume_server_pb.VolumeServerClient, collection string, vid uint32, indexBaseFileName string, throttler *util.WriteThrottler) error {
+	copyFileClient, err := client.CopyFile(context.Background(), &volume_server_pb.CopyFileRequest{
+		VolumeId:                 vid,
+		Ext:                      ".ecj",
+		CompactionRevision:       math.MaxUint32,
+		StopOffset:               math.MaxInt64,
+		Collection:               collection,
+		IsEcVolume:               true,
+		IgnoreSourceFileNotFound: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start copying volume %d .ecj file: %v", vid, err)
+	}
+	stagedPath := indexBaseFileName + erasure_coding.EcjIncomingSuffix
+	defer os.Remove(stagedPath)
+	if _, err := writeToFile(copyFileClient, stagedPath, throttler, false, true, nil); err != nil {
+		return fmt.Errorf("failed to copy %s: %v", stagedPath, err)
+	}
+	ecjPath := indexBaseFileName + ".ecj"
+	added, err := erasure_coding.MergeEcjFile(ecjPath, stagedPath)
+	if err != nil {
+		return fmt.Errorf("merge peer journal into %s: %w", ecjPath, err)
+	}
+	glog.V(1).Infof("volume %d: merged %d new deleted id(s) from peer into %s", vid, added, ecjPath)
+	return nil
+}
+
 func writeToFile(client volume_server_pb.VolumeServer_CopyFileClient, fileName string, wt *util.WriteThrottler, isAppend, ignoreSourceFileNotFound bool, progressFn storage.ProgressFunc) (modifiedTsNs int64, err error) {
 	glog.V(4).Infof("writing to %s", fileName)
 

@@ -3250,18 +3250,41 @@ impl VolumeServer for VolumeGrpcService {
                 })?
                 .into_inner();
 
-            let file_path = {
-                let base =
-                    crate::storage::volume::volume_file_name(&dest_idx_dir, &req.collection, vid);
-                format!("{}.ecj", base)
-            };
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file_path)
+            // Stage the peer's journal, then fold it into ours as a set union.
+            // Appending it whole never dedupes, so shards moving back and forth
+            // between servers grew journals geometrically.
+            let base =
+                crate::storage::volume::volume_file_name(&dest_idx_dir, &req.collection, vid);
+            let ecj_path = format!("{}.ecj", base);
+            let staged_path = format!(
+                "{}{}",
+                base,
+                crate::storage::erasure_coding::ecj_journal::ECJ_INCOMING_SUFFIX
+            );
+            let file = tokio::fs::File::create(&staged_path)
                 .await
-                .map_err(|e| Status::internal(format!("create {}: {}", file_path, e)))?;
-            drain_copy_stream_to_file(&mut stream, file, &file_path, ".ecj").await?;
+                .map_err(|e| Status::internal(format!("create {}: {}", staged_path, e)))?;
+            drain_copy_stream_to_file(&mut stream, file, &staged_path, ".ecj").await?;
+            let merged = {
+                let (ecj_path, staged_path) = (ecj_path.clone(), staged_path.clone());
+                tokio::task::spawn_blocking(move || {
+                    crate::storage::erasure_coding::ecj_journal::merge_ecj_file(
+                        &ecj_path,
+                        &staged_path,
+                    )
+                })
+                .await
+            };
+            let _ = tokio::fs::remove_file(&staged_path).await;
+            let added = merged
+                .map_err(|e| Status::internal(format!("merge into {}: {}", ecj_path, e)))?
+                .map_err(|e| Status::internal(format!("merge into {}: {}", ecj_path, e)))?;
+            tracing::debug!(
+                volume_id = vid.0,
+                added,
+                "merged peer .ecj into {}",
+                ecj_path
+            );
         }
 
         // Copy .vif file if requested
@@ -9495,13 +9518,7 @@ mod tests {
             "canonical shards must be preserved"
         );
         assert!(
-            service
-                .state
-                .store
-                .read()
-                .unwrap()
-                .locations[0]
-                .has_ec_volume(vid),
+            service.state.store.read().unwrap().locations[0].has_ec_volume(vid),
             "mounted shards must stay mounted"
         );
     }

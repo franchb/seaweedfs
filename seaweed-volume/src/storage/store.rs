@@ -1417,12 +1417,20 @@ impl Store {
                     crate::storage::volume::volume_file_name(&loc.idx_directory, collection, vid);
                 let data_base =
                     crate::storage::volume::volume_file_name(&loc.directory, collection, vid);
-                let _ = std::fs::remove_file(format!("{}.ecx", idx_base));
-                let _ = std::fs::remove_file(format!("{}.ecj", idx_base));
+                let remove_journal = |base: &str| {
+                    let _ = std::fs::remove_file(format!("{}.ecx", base));
+                    let _ = std::fs::remove_file(format!("{}.ecj", base));
+                    for suffix in [
+                        crate::storage::erasure_coding::ecj_journal::ECJ_COMPACT_TMP_SUFFIX,
+                        crate::storage::erasure_coding::ecj_journal::ECJ_INCOMING_SUFFIX,
+                    ] {
+                        let _ = std::fs::remove_file(format!("{}{}", base, suffix));
+                    }
+                };
+                remove_journal(&idx_base);
                 // Also try data directory in case .ecx/.ecj were created before -dir.idx
                 if loc.idx_directory != loc.directory {
-                    let _ = std::fs::remove_file(format!("{}.ecx", data_base));
-                    let _ = std::fs::remove_file(format!("{}.ecj", data_base));
+                    remove_journal(&data_base);
                 }
                 // A shard-only disk also drops its stale .vif (Go
                 // removeEcSharedIndexFiles): a live .idx means this disk still

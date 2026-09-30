@@ -12,6 +12,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::pb::master_pb;
 use crate::storage::erasure_coding::ec_locate;
 use crate::storage::erasure_coding::ec_shard::*;
+use crate::storage::erasure_coding::ecj_journal::{
+    ECJ_COMPACT_TMP_SUFFIX, ECJ_INCOMING_SUFFIX, EcjHolder, create_mode_0644, with_ecj_journal,
+};
 use crate::storage::io::read_exact_at;
 use crate::storage::io_error::IoErrorTracker;
 use crate::storage::needle::needle::{Needle, NeedleError, get_actual_size};
@@ -57,6 +60,42 @@ const ECJ_COMPACT_MIN_BYTES: i64 = 1 << 20;
 /// slack is normal; an order of magnitude is not.
 const ECJ_COMPACT_RATIO: i64 = 4;
 
+/// Points in mount-time compaction where tests inject a failure.
+#[derive(Clone, Copy, Debug)]
+enum EcjFault {
+    Rename = 1,
+    FsyncDir = 2,
+    Reopen = 4,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bitmask of `EcjFault`s to inject on this thread.
+    static ECJ_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Fails with an injected error when a test armed `point`; a no-op otherwise.
+fn ecj_fault(point: EcjFault) -> io::Result<()> {
+    #[cfg(test)]
+    if ECJ_FAULTS.with(|f| f.get() & point as u8 != 0) {
+        return Err(io::Error::other(format!("injected {:?} failure", point)));
+    }
+    let _ = point;
+    Ok(())
+}
+
+/// Open the `.ecj` journal's long-lived append handle.
+fn open_ecj_append(path: &str) -> io::Result<File> {
+    open_volume_file(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true),
+        path,
+    )
+}
+
 /// An erasure-coded volume managing its local shards and index.
 pub struct EcVolume {
     pub volume_id: VolumeId,
@@ -74,6 +113,10 @@ pub struct EcVolume {
     ecx_file: Option<File>,
     ecx_file_size: i64,
     ecj_file: Option<File>,
+    /// Registers this volume as a holder of its `.ecj` path, so a sibling
+    /// `EcVolume` on the same file never compacts it from under us. Dropped
+    /// (unregistering) by `close`, `destroy` or drop.
+    ecj_holder: Option<EcjHolder>,
     /// On-disk size of the .ecj deletion journal. Used only by IO helpers
     /// (seek / set_len on partial writes) — the authoritative runtime
     /// delete count comes from `deleted_needles.len()`.
@@ -479,6 +522,7 @@ impl EcVolume {
             ecx_file: None,
             ecx_file_size: 0,
             ecj_file: None,
+            ecj_holder: None,
             ecj_file_size: 0,
             deleted_needles: RwLock::new(HashSet::new()),
             disk_type: DiskType::default(),
@@ -561,6 +605,27 @@ impl EcVolume {
             crate::storage::volume::volume_file_name(&vol.ecx_actual_dir, collection, volume_id);
         let ecj_path = format!("{}.ecj", ecj_base);
 
+        // Open, repair, load and compact under the journal's lock, then
+        // register as one of its holders — see `ecj_journal`.
+        with_ecj_journal(&ecj_path, |holders| -> io::Result<()> {
+            vol.open_ecj(&ecj_path, *holders)?;
+            *holders += 1;
+            Ok(())
+        })?;
+        vol.ecj_holder = Some(EcjHolder::registered(&ecj_path));
+
+        // Load the generation-0 EC bitrot checksum sidecar. Optional, except
+        // when it contradicts the volume's own geometry — see
+        // load_bitrot_for_generation.
+        vol.load_active_bitrot_sidecar(&[])?;
+
+        Ok(vol)
+    }
+
+    /// Open the `.ecj` journal, repair a torn tail, seed `deleted_needles`
+    /// and compact a bloated journal. Called by `new()` with the journal lock
+    /// held; `other_holders` is how many other `EcVolume`s have it open.
+    fn open_ecj(&mut self, ecj_path: &str, other_holders: usize) -> io::Result<()> {
         // Repair a torn tail BEFORE the append handle exists.
         //
         // The file is a flat array of fixed-size records and the journal handle
@@ -581,15 +646,15 @@ impl EcVolume {
         {
             let repair = open_volume_file(
                 OpenOptions::new().read(true).write(true).create(true),
-                &ecj_path,
+                ecj_path,
             )?;
             let on_disk = repair.metadata()?.len() as i64;
             let ragged = on_disk % NEEDLE_ID_SIZE as i64;
             if ragged != 0 {
                 let whole = on_disk - ragged;
                 tracing::warn!(
-                    volume_id = volume_id.0,
-                    collection = %collection,
+                    volume_id = self.volume_id.0,
+                    collection = %self.collection,
                     on_disk_bytes = on_disk,
                     truncated_to = whole,
                     "truncating torn .ecj tail so later appends stay aligned",
@@ -599,50 +664,49 @@ impl EcVolume {
             }
         }
 
-        let ecj_file = open_volume_file(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .append(true),
-            &ecj_path,
-        )?;
-        vol.ecj_file_size = ecj_file.metadata()?.len() as i64;
-        vol.ecj_file = Some(ecj_file);
+        let ecj_file = open_ecj_append(ecj_path)?;
+        self.ecj_file_size = ecj_file.metadata()?.len() as i64;
+        self.ecj_file = Some(ecj_file);
 
-        // Seed the in-memory deleted set from the journal.
-        vol.load_deleted_needles_from_ecj()?;
+        // A compaction temp file only survives a crash before its rename, so
+        // the journal it was meant to replace is still whole. Nothing else
+        // writes this name, and the journal lock is held.
+        let tmp_path = format!("{}.compact.tmp", ecj_path);
+        if fs::remove_file(&tmp_path).is_ok() {
+            tracing::info!(volume_id = self.volume_id.0, "removed stale {}", tmp_path);
+        }
+
+        // Seed the in-memory deleted set from the journal. A failed load fails
+        // the mount before anything is compacted, so a partial set is never
+        // written back as the whole journal.
+        self.load_deleted_needles_from_ecj()?;
 
         // Then fold the journal back down to the set it encodes, if the append
         // paths have bloated it.
         //
         // A failure BEFORE the journal is replaced is non-fatal: nothing on disk
         // changed and the in-memory set is already correct, so a volume on a
-        // read-only or full disk still mounts and serves. A failure AFTER it is
-        // replaced is not survivable that way — `maybe_compact_ecj` leaves
-        // `ecj_file` as None in that case, and continuing would let
-        // `journal_delete` append to nothing (or, worse, to an unlinked inode)
-        // while reporting success, so the deletes would vanish at the next mount.
-        if let Err(e) = vol.maybe_compact_ecj() {
-            if vol.ecj_file.is_none() {
-                return Err(io::Error::other(format!(
-                    "ec volume {}: .ecj was compacted but could not be reopened: {}",
-                    volume_id.0, e
-                )));
+        // read-only or full disk still mounts and serves. A failure that leaves
+        // `ecj_file` as None is not survivable that way: continuing would let
+        // `journal_delete` append to nothing while reporting success, so the
+        // deletes would vanish at the next mount.
+        if let Err(e) = self.maybe_compact_ecj(ecj_path, other_holders) {
+            if self.ecj_file.is_none() {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "ec volume {}: .ecj compaction left no journal handle: {}",
+                        self.volume_id.0, e
+                    ),
+                ));
             }
             tracing::warn!(
-                volume_id = volume_id.0,
+                volume_id = self.volume_id.0,
                 error = %e,
                 "compact .ecj",
             );
         }
-
-        // Load the generation-0 EC bitrot checksum sidecar. Optional, except
-        // when it contradicts the volume's own geometry — see
-        // load_bitrot_for_generation.
-        vol.load_active_bitrot_sidecar(&[])?;
-
-        Ok(vol)
+        Ok(())
     }
 
     /// Re-resolve the checksum sidecar for a volume that is already mounted. A
@@ -884,57 +948,29 @@ impl EcVolume {
         Ok(())
     }
 
-    /// Rewrite a bloated `.ecj` from the set just loaded out of it.
+    /// Rewrite a bloated `.ecj` from the set just loaded out of it. Called by
+    /// `open_ecj` with the journal lock held.
     ///
     /// The journal is semantically a SET of deleted needle ids, but it is
-    /// written as an append-only log that nothing dedupes or truncates. Several
-    /// paths append a peer's *entire* journal onto this one —
-    /// `VolumeEcShardsCopy` (`copy_ecj_file`), EC index recovery, and
-    /// `ec_decode`'s deliberate merge across holders — so a volume whose shards
-    /// are repeatedly balanced between two servers grows the file geometrically.
-    /// Observed in production: 1.51 TB and 1.30 TB for one volume holding ~100
-    /// distinct ids, which wedged both owning volume servers at startup.
+    /// written as an append-only log. Peer journals used to be appended whole
+    /// onto this one — `VolumeEcShardsCopy` (`copy_ecj_file`), EC index
+    /// recovery — which `merge_ecj_file` now limits to the difference, so a
+    /// volume whose shards were repeatedly balanced between two servers grew
+    /// the file geometrically. Observed in production: 1.51 TB and 1.30 TB for
+    /// one volume holding ~100 distinct ids, which wedged both owning volume
+    /// servers at startup. This folds such a journal back down.
     ///
     /// Compaction is safe because the set IS the journal's meaning: every id in
     /// the file is in the set, and no id is in the set that was not in the file
-    /// (this runs at mount, before any runtime delete). Crash-safe via temp
-    /// file + fsync + rename.
-    fn maybe_compact_ecj(&mut self) -> io::Result<()> {
-        // Only compact a journal this instance solely owns.
-        //
-        // A store holds one EcVolume per disk location, and several of them can
-        // exist for the same volume id (`Store::find_all_ec_volumes_mut`). When
-        // `-dir.idx` points every disk at one index directory, all of those
-        // instances resolve `.ecx`/`.ecj` to the SAME path. Compaction replaces
-        // that path with a new inode and reopens only this instance's handle, so
-        // a sibling mounted earlier would go on appending to the unlinked inode:
-        // `find_ec_volume_mut` hands deletes to whichever holder it finds first,
-        // that holder acknowledges them, and they are gone at the next mount.
-        //
-        // The constructor cannot see its siblings, so be conservative rather than
-        // clever: compact only when the journal lives in this instance's own data
-        // directory, which by construction no other disk location shares. A
-        // server running a shared index directory therefore keeps an unbounded
-        // journal — worse than fixing it, better than losing acknowledged
-        // deletes — until replacement is coordinated across holders.
-        if self.ecx_actual_dir != self.dir {
-            tracing::debug!(
-                volume_id = self.volume_id.0,
-                ecx_dir = %self.ecx_actual_dir,
-                data_dir = %self.dir,
-                "skipping .ecj compaction: journal may be shared with another holder",
-            );
-            return Ok(());
-        }
-
-        let mut ids: Vec<NeedleId> = {
-            let set = self
-                .deleted_needles
-                .read()
-                .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?;
-            set.iter().copied().collect()
-        };
-        let compacted_len = (ids.len() * NEEDLE_ID_SIZE) as i64;
+    /// (this runs at mount, before any runtime delete, and only after a
+    /// complete load). Crash-safe via temp file + fsync + rename.
+    fn maybe_compact_ecj(&mut self, ecj_path: &str, other_holders: usize) -> io::Result<()> {
+        let unique = self
+            .deleted_needles
+            .read()
+            .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?
+            .len();
+        let compacted_len = (unique * NEEDLE_ID_SIZE) as i64;
 
         // Leave healthy journals alone: rewriting on every mount would churn
         // the disk for no gain.
@@ -944,39 +980,34 @@ impl EcVolume {
             return Ok(());
         }
 
+        // Replacing the inode would strand every other holder's appends on the
+        // unlinked file: `find_ec_volume_mut` hands deletes to whichever holder
+        // it finds first, that holder acknowledges them, and they are gone at
+        // the next mount. No holder can register while the journal lock is
+        // held, so a count of zero is exact.
+        if other_holders > 0 {
+            tracing::warn!(
+                volume_id = self.volume_id.0,
+                collection = %self.collection,
+                on_disk_bytes = self.ecj_file_size,
+                unique_ids = unique,
+                other_holders,
+                "bloated .ecj is held open by other ec volumes in this process; skipping compaction until it is mounted alone",
+            );
+            return Ok(());
+        }
+
         tracing::warn!(
             volume_id = self.volume_id.0,
             collection = %self.collection,
             on_disk_bytes = self.ecj_file_size,
-            unique_ids = ids.len(),
+            unique_ids = unique,
             compacted_bytes = compacted_len,
             "compacting bloated .ecj deletion journal",
         );
 
-        let ecj_path = format!("{}.ecj", self.idx_base_name());
         let tmp_path = format!("{}.compact.tmp", ecj_path);
-
-        // Sorted so the rewritten file is deterministic: two holders that
-        // compact the same set produce byte-identical journals, which makes a
-        // difference between them meaningful rather than ordering noise.
-        ids.sort_unstable();
-
-        // Stream the ids out rather than materialising the whole encoded
-        // journal: the set and the sorted vector are already resident, and a
-        // third full-size buffer is a needless contiguous allocation at mount.
-        let write_tmp = |path: &str, ids: &[NeedleId]| -> io::Result<()> {
-            let mut w = BufWriter::new(File::create(path)?);
-            let mut buf = [0u8; NEEDLE_ID_SIZE];
-            for id in ids {
-                id.to_bytes(&mut buf);
-                w.write_all(&buf)?;
-            }
-            w.flush()?;
-            w.into_inner()
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .sync_all()
-        };
-        if let Err(e) = write_tmp(&tmp_path, &ids) {
+        if let Err(e) = self.write_compacted_ecj(&tmp_path) {
             // Leaving the partial temp file behind would pin its bytes for the
             // life of the process — and the likeliest reason to land here is
             // ENOSPC, where those bytes are exactly what is scarce.
@@ -988,25 +1019,33 @@ impl EcVolume {
         // rename over a file that is still open fails outright, which would
         // make compaction a permanent no-op there; on Unix the handle would
         // survive as an unlinked inode, which is worse than useless. From here
-        // until the reopen below, `ecj_file` is None on purpose: that is the
-        // signal `new()` uses to tell "nothing was published" from "the journal
-        // was replaced and we have no handle to it".
+        // until the reopen below, `ecj_file` is None on purpose: `open_ecj`
+        // treats a failure that leaves it None as fatal.
         self.ecj_file = None;
 
-        if let Err(e) = fs::rename(&tmp_path, &ecj_path) {
+        if let Err(rename_err) =
+            ecj_fault(EcjFault::Rename).and_then(|_| fs::rename(&tmp_path, ecj_path))
+        {
             let _ = fs::remove_file(&tmp_path);
-            // Nothing was published — the original journal is still in place, so
+            // Nothing was published: the original journal is still in place, so
             // restore a working handle and let the caller treat this as
             // non-fatal.
-            self.ecj_file = Some(open_volume_file(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .append(true),
-                &ecj_path,
-            )?);
-            return Err(e);
+            let reopened = ecj_fault(EcjFault::Reopen)
+                .and_then(|_| open_ecj_append(ecj_path))
+                .map_err(|open_err| {
+                    io::Error::new(
+                        open_err.kind(),
+                        format!(
+                            "rename {}: {}; reopen original journal: {}",
+                            tmp_path, rename_err, open_err
+                        ),
+                    )
+                })?;
+            self.ecj_file = Some(reopened);
+            return Err(io::Error::new(
+                rename_err.kind(),
+                format!("rename {}: {}", tmp_path, rename_err),
+            ));
         }
 
         // Syncing the temp file persisted its contents, not the directory entry
@@ -1016,23 +1055,48 @@ impl EcVolume {
         // paths in this crate (ec_decoder, volume_idx_rebuild, volume_idx_repair).
         // Post-publication, so a failure is fatal for the same reason the reopen
         // below is.
-        crate::storage::volume::fsync_dir(&ecj_path)?;
+        ecj_fault(EcjFault::FsyncDir)
+            .and_then(|_| crate::storage::volume::fsync_dir(ecj_path))
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("sync directory after replacing {}: {}", ecj_path, e),
+                )
+            })?;
 
         // Past this point the journal HAS been replaced. Reopen so later
         // journal_delete appends land in the file we just wrote; if that fails,
-        // `ecj_file` stays None and `new()` turns it into a mount failure rather
-        // than a volume that silently drops deletes.
-        let reopened = open_volume_file(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .append(true),
-            &ecj_path,
-        )?;
+        // `ecj_file` stays None and `open_ecj` turns it into a mount failure
+        // rather than a volume that silently drops deletes.
+        let reopened = ecj_fault(EcjFault::Reopen)
+            .and_then(|_| open_ecj_append(ecj_path))
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("reopen compacted {}: {}", ecj_path, e))
+            })?;
         self.ecj_file_size = reopened.metadata()?.len() as i64;
         self.ecj_file = Some(reopened);
         Ok(())
+    }
+
+    /// Stream `deleted_needles` straight to `tmp_path`, one record per id,
+    /// so compaction needs no second copy of the set. The order is whatever
+    /// the set yields; the journal is a set, and readers do not depend on it.
+    fn write_compacted_ecj(&self, tmp_path: &str) -> io::Result<()> {
+        let file = create_mode_0644(OpenOptions::new().write(true).create(true).truncate(true))
+            .open(tmp_path)?;
+        let mut w = BufWriter::with_capacity(ECJ_LOAD_CHUNK_BYTES, file);
+        {
+            let set = self
+                .deleted_needles
+                .read()
+                .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?;
+            let mut buf = [0u8; NEEDLE_ID_SIZE];
+            for id in set.iter() {
+                id.to_bytes(&mut buf);
+                w.write_all(&buf)?;
+            }
+        }
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()
     }
 
     /// Returns (file_count, delete_count) for this EC volume. Mirrors Go's
@@ -1782,15 +1846,7 @@ impl EcVolume {
         // in-memory deleted set (all of its contents are now materialized
         // in .ecx), and reset the cached size.
         fs::remove_file(&ecj_path)?;
-        let ecj_file = open_volume_file(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .append(true),
-            &ecj_path,
-        )?;
-        self.ecj_file = Some(ecj_file);
+        self.ecj_file = Some(open_ecj_append(&ecj_path)?);
         self.ecj_file_size = 0;
         if let Ok(mut set) = self.deleted_needles.write() {
             set.clear();
@@ -2036,6 +2092,7 @@ impl EcVolume {
         }
         self.ecx_file = None;
         self.ecj_file = None;
+        self.ecj_holder = None;
     }
 
     pub fn destroy(&mut self) {
@@ -2054,6 +2111,8 @@ impl EcVolume {
         );
         let _ = fs::remove_file(format!("{}.ecx", actual_base));
         let _ = fs::remove_file(format!("{}.ecj", actual_base));
+        let _ = fs::remove_file(format!("{}{}", actual_base, ECJ_COMPACT_TMP_SUFFIX));
+        let _ = fs::remove_file(format!("{}{}", actual_base, ECJ_INCOMING_SUFFIX));
         let _ = fs::remove_file(format!("{}.vif", actual_base));
         // Also sweep the originally-configured idx dir in case stale files
         // exist there (ecx_file_name() / ecj_file_name() now resolve from
@@ -2066,6 +2125,8 @@ impl EcVolume {
             );
             let _ = fs::remove_file(format!("{}.ecx", idx_base));
             let _ = fs::remove_file(format!("{}.ecj", idx_base));
+            let _ = fs::remove_file(format!("{}{}", idx_base, ECJ_COMPACT_TMP_SUFFIX));
+            let _ = fs::remove_file(format!("{}{}", idx_base, ECJ_INCOMING_SUFFIX));
             let _ = fs::remove_file(format!("{}.vif", idx_base));
         }
         if self.ecx_actual_dir != self.dir && self.dir_idx != self.dir {
@@ -2076,6 +2137,8 @@ impl EcVolume {
             );
             let _ = fs::remove_file(format!("{}.ecx", data_base));
             let _ = fs::remove_file(format!("{}.ecj", data_base));
+            let _ = fs::remove_file(format!("{}{}", data_base, ECJ_COMPACT_TMP_SUFFIX));
+            let _ = fs::remove_file(format!("{}{}", data_base, ECJ_INCOMING_SUFFIX));
             let _ = fs::remove_file(format!("{}.vif", data_base));
         }
         // Go's Destroy() also removes bitrot checksum sidecars so a later
@@ -2094,12 +2157,14 @@ impl EcVolume {
         }
         self.ecx_file = None;
         self.ecj_file = None;
+        self.ecj_holder = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::erasure_coding::ecj_journal;
     use tempfile::TempDir;
 
     /// Go's NewEcVolume fails with os.ErrNotExist when neither directory has an
@@ -2823,6 +2888,47 @@ mod tests {
         assert_eq!(deleted, ids);
     }
 
+    fn ecj_path_of(dir: &str, vid: VolumeId) -> String {
+        format!(
+            "{}.ecj",
+            crate::storage::volume::volume_file_name(dir, "", vid)
+        )
+    }
+
+    fn file_len(path: &str) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    fn sorted(mut ids: Vec<NeedleId>) -> Vec<NeedleId> {
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Lay out volume `vid` in `dir` with an empty .ecx and a journal repeating
+    /// ids 1000..1100 4096 times: 3.125 MiB for 800 B of ids, over both
+    /// compaction thresholds.
+    fn seed_bloated(dir: &str, vid: VolumeId) -> Vec<NeedleId> {
+        write_ecx_file(dir, "", vid, &[]);
+        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", vid, &ids, 4096);
+        ids
+    }
+
+    /// Arms `EcjFault`s on this thread until dropped.
+    struct ArmedFaults;
+    impl ArmedFaults {
+        fn new(faults: &[EcjFault]) -> Self {
+            let mask = faults.iter().fold(0u8, |m, f| m | *f as u8);
+            ECJ_FAULTS.with(|f| f.set(mask));
+            ArmedFaults
+        }
+    }
+    impl Drop for ArmedFaults {
+        fn drop(&mut self) {
+            ECJ_FAULTS.with(|f| f.set(0));
+        }
+    }
+
     /// A journal that repeats a handful of ids until it is megabytes long must
     /// mount to exactly those ids and be rewritten down to the set it encodes.
     /// This is the production failure: 1.51 TB of ~100 distinct ids.
@@ -2830,44 +2936,36 @@ mod tests {
     fn test_bloated_ecj_is_compacted_on_load() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
-        write_ecx_file(dir, "", VolumeId(37), &[]);
-
-        // 100 unique ids x 4096 repeats x 8 B = 3.125 MiB on disk for 800 B of
-        // actual information — over both compaction thresholds.
-        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
-        write_bloated_ecj(dir, "", VolumeId(37), &ids, 4096);
-
-        let ecj_path = format!(
-            "{}.ecj",
-            crate::storage::volume::volume_file_name(dir, "", VolumeId(37))
-        );
-        let before = std::fs::metadata(&ecj_path).unwrap().len();
+        let ids = seed_bloated(dir, VolumeId(37));
+        let ecj_path = ecj_path_of(dir, VolumeId(37));
+        let before = file_len(&ecj_path);
         assert_eq!(before, 100 * 4096 * NEEDLE_ID_SIZE as u64);
 
         let vol = EcVolume::new(dir, dir, "", VolumeId(37)).unwrap();
 
         // Every id survived, with no duplicates.
         let deleted = vol.read_deleted_needles().unwrap();
-        assert_eq!(deleted, ids, "compaction must preserve the deleted set");
+        assert_eq!(
+            sorted(deleted),
+            ids,
+            "compaction must preserve the deleted set"
+        );
 
         // And the file is now exactly the set.
-        let after = std::fs::metadata(&ecj_path).unwrap().len();
+        let after = file_len(&ecj_path);
         assert_eq!(
             after,
             ids.len() as u64 * NEEDLE_ID_SIZE as u64,
             "journal should have been folded down to one entry per id",
         );
-        assert!(after < before);
-
-        // No temp file left behind.
         assert!(!std::path::Path::new(&format!("{}.compact.tmp", ecj_path)).exists());
 
         // Remounting the compacted file yields the same set, and leaves it
         // alone the second time.
         drop(vol);
         let vol2 = EcVolume::new(dir, dir, "", VolumeId(37)).unwrap();
-        assert_eq!(vol2.read_deleted_needles().unwrap(), ids);
-        assert_eq!(std::fs::metadata(&ecj_path).unwrap().len(), after);
+        assert_eq!(sorted(vol2.read_deleted_needles().unwrap()), ids);
+        assert_eq!(file_len(&ecj_path), after);
     }
 
     /// Appends must still land in the file after a compaction reopened the
@@ -2876,6 +2974,7 @@ mod tests {
     fn test_journal_delete_after_compaction_persists() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
+        let ids = seed_bloated(dir, VolumeId(38));
         // journal_delete only appends on a live->tombstone transition, so the
         // needle must exist in .ecx.
         write_ecx_file(
@@ -2884,19 +2983,24 @@ mod tests {
             VolumeId(38),
             &[(NeedleId(7), Offset::from_actual_offset(8), Size(10))],
         );
-        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
-        write_bloated_ecj(dir, "", VolumeId(38), &ids, 4096);
 
         let mut vol = EcVolume::new(dir, dir, "", VolumeId(38)).unwrap();
+        assert!(vol.ecj_file.is_some(), "mount must leave a journal handle");
         vol.journal_delete(NeedleId(7)).unwrap();
+        // The handle must point at the pathname, not at a replaced inode: a
+        // delete has to be visible to a fresh reader of the file.
+        assert_eq!(
+            file_len(&ecj_path_of(dir, VolumeId(38))),
+            ((ids.len() + 1) * NEEDLE_ID_SIZE) as u64,
+            "post-compaction append did not reach the journal's pathname",
+        );
         drop(vol);
 
         let vol2 = EcVolume::new(dir, dir, "", VolumeId(38)).unwrap();
         let deleted = vol2.read_deleted_needles().unwrap();
         assert!(
             deleted.contains(&NeedleId(7)),
-            "post-compaction append was lost across remount: {:?}",
-            &deleted[..deleted.len().min(5)],
+            "post-compaction append was lost"
         );
         assert_eq!(deleted.len(), ids.len() + 1);
     }
@@ -2913,35 +3017,47 @@ mod tests {
         let ids: Vec<NeedleId> = (1..=100).map(NeedleId).collect();
         write_bloated_ecj(dir, "", VolumeId(39), &ids, 3);
 
-        let ecj_path = format!(
-            "{}.ecj",
-            crate::storage::volume::volume_file_name(dir, "", VolumeId(39))
-        );
-        let before_meta = std::fs::metadata(&ecj_path).unwrap();
+        let ecj_path = ecj_path_of(dir, VolumeId(39));
         let before_bytes = std::fs::read(&ecj_path).unwrap();
-        // Capture mtime/inode stability: a healthy journal must never be
-        // rewritten.
-        let before_mtime = before_meta.modified().unwrap();
+        let before_mtime = std::fs::metadata(&ecj_path).unwrap().modified().unwrap();
 
         let vol = EcVolume::new(dir, dir, "", VolumeId(39)).unwrap();
 
         // The in-memory set is deduped; the on-disk journal is deliberately
-        // left as-is. `read_deleted_needles` reports raw file entries, so it
-        // still sees all three copies — that is the untouched-file assertion.
+        // left as-is.
         let (_, delete_count) = vol.file_and_delete_count();
         assert_eq!(delete_count, ids.len() as u64);
-        assert_eq!(vol.read_deleted_needles().unwrap().len(), ids.len() * 3);
-
-        let after_meta = std::fs::metadata(&ecj_path).unwrap();
-        let after_bytes = std::fs::read(&ecj_path).unwrap();
         assert_eq!(
-            before_bytes, after_bytes,
+            before_bytes,
+            std::fs::read(&ecj_path).unwrap(),
             "small journal must not be rewritten"
         );
         assert_eq!(
             before_mtime,
-            after_meta.modified().unwrap(),
+            std::fs::metadata(&ecj_path).unwrap().modified().unwrap(),
             "small journal mtime must be unchanged"
+        );
+    }
+
+    /// A journal over the size floor but under the ratio is ordinary slack,
+    /// not bloat, and must be left alone.
+    #[test]
+    fn test_ecj_over_floor_under_ratio_is_not_rewritten() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(dir, "", VolumeId(46), &[]);
+        // 400 KB of ids three times over: 1.2 MB on disk, 3x the set.
+        let ids: Vec<NeedleId> = (1..=50_000).map(NeedleId).collect();
+        write_bloated_ecj(dir, "", VolumeId(46), &ids, 3);
+        let ecj_path = ecj_path_of(dir, VolumeId(46));
+        let before = file_len(&ecj_path);
+        assert!(before as i64 > ECJ_COMPACT_MIN_BYTES);
+
+        let _vol = EcVolume::new(dir, dir, "", VolumeId(46)).unwrap();
+        assert_eq!(
+            file_len(&ecj_path),
+            before,
+            "a 3x journal is under the 4x ratio"
         );
     }
 
@@ -2951,17 +3067,10 @@ mod tests {
     fn test_torn_tail_and_bloated_ecj_repaired_and_compacted() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
-        write_ecx_file(dir, "", VolumeId(45), &[]);
-
-        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
-        write_bloated_ecj(dir, "", VolumeId(45), &ids, 4096);
+        let ids = seed_bloated(dir, VolumeId(45));
+        let ecj_path = ecj_path_of(dir, VolumeId(45));
         // Append a torn tail: 3 stray bytes past the last whole record.
         {
-            use std::io::Write;
-            let ecj_path = format!(
-                "{}.ecj",
-                crate::storage::volume::volume_file_name(dir, "", VolumeId(45))
-            );
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&ecj_path)
@@ -2972,89 +3081,178 @@ mod tests {
 
         let vol = EcVolume::new(dir, dir, "", VolumeId(45)).unwrap();
         assert_eq!(
-            vol.read_deleted_needles().unwrap(),
+            sorted(vol.read_deleted_needles().unwrap()),
             ids,
             "torn+oversized journal must repair and compact without loss"
         );
-        let ecj_path = format!(
-            "{}.ecj",
-            crate::storage::volume::volume_file_name(dir, "", VolumeId(45))
-        );
         assert_eq!(
-            std::fs::metadata(&ecj_path).unwrap().len(),
+            file_len(&ecj_path),
             ids.len() as u64 * NEEDLE_ID_SIZE as u64
         );
     }
 
-    /// A journal reached through a shared index directory must be left alone:
-    /// another disk location may hold the same file open, and replacing the
-    /// inode under it would strand every delete that holder acknowledges.
+    /// A journal in a shared index directory is compacted when this volume is
+    /// its only holder: nothing else has the old inode open.
     #[test]
-    fn test_shared_index_dir_journal_is_not_compacted() {
+    fn test_shared_index_dir_sole_holder_is_compacted() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let idx_dir = tmp.path().join("idx");
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&idx_dir).unwrap();
         let (data, idx) = (data_dir.to_str().unwrap(), idx_dir.to_str().unwrap());
-
-        // .ecx and .ecj live in the shared index dir, as with -dir.idx.
-        write_ecx_file(idx, "", VolumeId(44), &[]);
-        let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
-        write_bloated_ecj(idx, "", VolumeId(44), &ids, 4096);
-
-        let ecj_path = format!(
-            "{}.ecj",
-            crate::storage::volume::volume_file_name(idx, "", VolumeId(44))
-        );
-        let before = std::fs::metadata(&ecj_path).unwrap().len();
+        let ids = seed_bloated(idx, VolumeId(44));
 
         let vol = EcVolume::new(data, idx, "", VolumeId(44)).unwrap();
-
-        // The set still loads correctly — only the rewrite is suppressed.
-        // Deletes must still be acknowledged and persisted via the shared path.
         let (_, delete_count) = vol.file_and_delete_count();
         assert_eq!(delete_count, ids.len() as u64);
         assert_eq!(
-            std::fs::metadata(&ecj_path).unwrap().len(),
-            before,
-            "a journal in a shared index dir must not be replaced under a sibling holder",
+            file_len(&ecj_path_of(idx, VolumeId(44))),
+            ids.len() as u64 * NEEDLE_ID_SIZE as u64,
         );
     }
 
-    /// Compaction must never leave the volume holding a handle that does not
-    /// refer to the journal's pathname, and must not leave its temp file behind.
+    /// A journal another EcVolume already holds must not be replaced under it —
+    /// that holder's later deletes would land on the unlinked inode. This is
+    /// cross-disk reconcile: a second disk mounting against the first disk's
+    /// index. Once both are gone, the next mount compacts.
     #[test]
-    fn test_compaction_leaves_a_usable_handle_and_no_temp_file() {
+    fn test_held_journal_is_not_compacted() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_str().unwrap();
+        let (idx_dir, data_a, data_b) = (
+            tmp.path().join("idx"),
+            tmp.path().join("a"),
+            tmp.path().join("b"),
+        );
+        for d in [&idx_dir, &data_a, &data_b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (idx, a, b) = (
+            idx_dir.to_str().unwrap(),
+            data_a.to_str().unwrap(),
+            data_b.to_str().unwrap(),
+        );
         write_ecx_file(
-            dir,
+            idx,
             "",
-            VolumeId(43),
+            VolumeId(47),
             &[(NeedleId(7), Offset::from_actual_offset(8), Size(10))],
         );
+
+        // Disk A mounts first, while the journal is still small.
+        let mut vol_a = EcVolume::new(a, idx, "", VolumeId(47)).unwrap();
+        let ecj_path = ecj_path_of(idx, VolumeId(47));
+        assert_eq!(ecj_journal::holders_of(&ecj_path), 1);
+
+        // The journal then bloats in place, and disk B mounts against it.
         let ids: Vec<NeedleId> = (1000..1100).map(NeedleId).collect();
-        write_bloated_ecj(dir, "", VolumeId(43), &ids, 4096);
+        write_bloated_ecj(idx, "", VolumeId(47), &ids, 4096);
+        let bloated = file_len(&ecj_path);
+        let vol_b = EcVolume::new(b, idx, "", VolumeId(47)).unwrap();
+        assert_eq!(
+            file_len(&ecj_path),
+            bloated,
+            "held journal must not be replaced"
+        );
+        assert_eq!(ecj_journal::holders_of(&ecj_path), 2);
 
-        let mut vol = EcVolume::new(dir, dir, "", VolumeId(43)).unwrap();
-        assert!(vol.ecj_file.is_some(), "mount must leave a journal handle");
+        // A's delete still reaches the file every later mount reads.
+        vol_a.journal_delete(NeedleId(7)).unwrap();
+        drop(vol_a);
+        drop(vol_b);
+        assert_eq!(ecj_journal::holders_of(&ecj_path), 0);
 
-        let ecj_path = format!(
-            "{}.ecj",
-            crate::storage::volume::volume_file_name(dir, "", VolumeId(43))
+        let vol_c = EcVolume::new(a, idx, "", VolumeId(47)).unwrap();
+        assert!(
+            vol_c.is_needle_deleted(NeedleId(7)),
+            "a holder's delete was stranded"
+        );
+        assert_eq!(
+            file_len(&ecj_path),
+            ((ids.len() + 1) * NEEDLE_ID_SIZE) as u64,
+            "sole holder compacts",
+        );
+    }
+
+    /// A failed rename publishes nothing: the mount succeeds on the original
+    /// journal with a working handle, and no temp file is left behind.
+    #[test]
+    fn test_compaction_rename_failure_keeps_original() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let ids = seed_bloated(dir, VolumeId(48));
+        let ecj_path = ecj_path_of(dir, VolumeId(48));
+        let before = file_len(&ecj_path);
+
+        let _faults = ArmedFaults::new(&[EcjFault::Rename]);
+        let vol = EcVolume::new(dir, dir, "", VolumeId(48)).unwrap();
+        assert!(
+            vol.ecj_file.is_some(),
+            "handle must be restored after a failed rename"
+        );
+        assert_eq!(vol.file_and_delete_count().1, ids.len() as u64);
+        assert_eq!(
+            file_len(&ecj_path),
+            before,
+            "original journal must be untouched"
         );
         assert!(!std::path::Path::new(&format!("{}.compact.tmp", ecj_path)).exists());
+    }
 
-        // The handle must point at the pathname, not at a replaced inode: a
-        // delete has to be visible to a fresh reader of the file.
-        vol.journal_delete(NeedleId(7)).unwrap();
-        let on_disk = std::fs::metadata(&ecj_path).unwrap().len();
-        assert_eq!(
-            on_disk,
-            ((ids.len() + 1) * NEEDLE_ID_SIZE) as u64,
-            "post-compaction append did not reach the journal's pathname",
+    /// When the rename fails AND the original cannot be reopened, the mount
+    /// fails, the error names both causes rather than claiming a compaction
+    /// happened, and the volume is not left registered as a holder.
+    #[test]
+    fn test_compaction_rename_and_reopen_failure_reports_both() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        seed_bloated(dir, VolumeId(49));
+
+        let _faults = ArmedFaults::new(&[EcjFault::Rename, EcjFault::Reopen]);
+        let err = EcVolume::new(dir, dir, "", VolumeId(49)).err().unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("injected Rename failure"), "{msg}");
+        assert!(msg.contains("injected Reopen failure"), "{msg}");
+        assert!(!msg.contains("was compacted"), "{msg}");
+        assert_eq!(ecj_journal::holders_of(&ecj_path_of(dir, VolumeId(49))), 0);
+    }
+
+    /// Past the rename the journal is replaced, so a failed directory sync or
+    /// reopen must fail the mount rather than serve without a journal handle.
+    #[test]
+    fn test_compaction_failure_after_rename_is_a_mount_error() {
+        for (vid, fault) in [(50, EcjFault::FsyncDir), (51, EcjFault::Reopen)] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+            seed_bloated(dir, VolumeId(vid));
+
+            let _faults = ArmedFaults::new(&[fault]);
+            let err = EcVolume::new(dir, dir, "", VolumeId(vid)).err();
+            let msg = err.map(|e| e.to_string()).unwrap_or_default();
+            assert!(
+                msg.contains(&format!("injected {:?} failure", fault)),
+                "{fault:?}: mount must fail, got {msg:?}"
+            );
+            assert_eq!(ecj_journal::holders_of(&ecj_path_of(dir, VolumeId(vid))), 0);
+        }
+    }
+
+    /// A temp file left by a crash before the rename is removed at mount, even
+    /// when the journal does not need compacting.
+    #[test]
+    fn test_stale_compaction_temp_file_removed_on_mount() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        write_ecx_file(dir, "", VolumeId(52), &[]);
+        let tmp_path = format!(
+            "{}{}",
+            crate::storage::volume::volume_file_name(dir, "", VolumeId(52)),
+            ECJ_COMPACT_TMP_SUFFIX
         );
+        std::fs::write(&tmp_path, b"partial").unwrap();
+
+        let _vol = EcVolume::new(dir, dir, "", VolumeId(52)).unwrap();
+        assert!(!std::path::Path::new(&tmp_path).exists());
     }
 
     #[test]

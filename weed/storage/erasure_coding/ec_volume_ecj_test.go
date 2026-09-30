@@ -85,111 +85,104 @@ func TestEcjLoadsAcrossChunkBoundary(t *testing.T) {
 	assert.False(t, ev.IsNeedleDeleted(count+1))
 }
 
-func writeBloatedEcj(t *testing.T, base string, ids []types.NeedleId, repeats int) {
+func ecjSize(t *testing.T, path string) int64 {
 	t.Helper()
-	rec := make([]byte, types.NeedleIdSize)
-	one := make([]byte, 0, len(ids)*types.NeedleIdSize)
-	for _, id := range ids {
-		types.NeedleIdToBytes(rec, id)
-		one = append(one, rec...)
-	}
-	f, err := os.Create(base + ".ecj")
+	fi, err := os.Stat(path)
 	require.NoError(t, err)
-	for i := 0; i < repeats; i++ {
-		_, err := f.Write(one)
-		require.NoError(t, err)
-	}
-	require.NoError(t, f.Sync())
-	require.NoError(t, f.Close())
+	return fi.Size()
 }
 
 // A bloated journal (many repeats of few ids) must mount to exactly those ids
 // and be rewritten down to one entry per id.
 func TestEcjBloatedIsCompactedOnMount(t *testing.T) {
 	dir := t.TempDir()
-
-	ids := make([]types.NeedleId, 0, 100)
-	for id := types.NeedleId(1000); id < 1100; id++ {
-		ids = append(ids, id)
-	}
-	base := erasure_coding.EcShardFileName("", dir, 7)
-	require.NoError(t, os.WriteFile(base+".ecx", nil, 0644))
-	require.NoError(t, os.WriteFile(base+".vif", []byte{}, 0644))
-	writeBloatedEcj(t, base, ids, 4096) // 100*4096*8 = 3.1 MiB
-
-	before, err := os.Stat(base + ".ecj")
-	require.NoError(t, err)
-	require.Equal(t, int64(100*4096*types.NeedleIdSize), before.Size())
+	base, ids := erasure_coding.SeedBloatedEcVolume(t, dir, 4096)
+	before := ecjSize(t, base+".ecj")
+	require.Equal(t, int64(100*4096*types.NeedleIdSize), before)
 
 	ev, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
 	require.NoError(t, err)
-	defer ev.Close()
 
 	for _, id := range ids {
 		assert.True(t, ev.IsNeedleDeleted(id), "id %d", id)
 	}
-
-	after, err := os.Stat(base + ".ecj")
-	require.NoError(t, err)
-	assert.Equal(t, int64(len(ids)*types.NeedleIdSize), after.Size())
-	assert.Less(t, after.Size(), before.Size())
-	assert.NoFileExists(t, base+".ecj.compact.tmp")
+	after := ecjSize(t, base+".ecj")
+	assert.Equal(t, int64(len(ids)*types.NeedleIdSize), after)
+	assert.NoFileExists(t, base+erasure_coding.EcjCompactTmpSuffix)
+	ev.Close()
 
 	// Remount is idempotent.
-	ev.Close()
 	ev2, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
 	require.NoError(t, err)
 	defer ev2.Close()
 	for _, id := range ids {
 		assert.True(t, ev2.IsNeedleDeleted(id), "id %d", id)
 	}
-	again, err := os.Stat(base + ".ecj")
+	assert.Equal(t, after, ecjSize(t, base+".ecj"))
+}
+
+// A delete taken after compaction must land in the replacement journal.
+func TestEcjDeleteAfterCompactionPersists(t *testing.T) {
+	dir := t.TempDir()
+	base, ids := erasure_coding.SeedBloatedEcVolume(t, dir, 4096)
+	require.NoError(t, os.WriteFile(base+".ecx",
+		makeNeedleMapEntry(types.NeedleId(7), types.ToOffset(8), types.Size(10)), 0644))
+
+	ev, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
 	require.NoError(t, err)
-	assert.Equal(t, after.Size(), again.Size())
+	require.NoError(t, ev.DeleteNeedleFromEcx(7))
+	ev.Close()
+	assert.Equal(t, int64((len(ids)+1)*types.NeedleIdSize), ecjSize(t, base+".ecj"))
+
+	ev2, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
+	require.NoError(t, err)
+	defer ev2.Close()
+	assert.True(t, ev2.IsNeedleDeleted(7))
 }
 
 // A healthy small journal must never be rewritten.
 func TestEcjHealthyIsNotRewritten(t *testing.T) {
 	dir := t.TempDir()
-
-	ids := make([]types.NeedleId, 0, 100)
-	for id := types.NeedleId(1); id <= 100; id++ {
-		ids = append(ids, id)
-	}
-	ev, base := mountEcVolume(t, dir, nil, ecjBytes(ids...))
-	ev.Close()
-	// Rewrite the 100-id journal 3x: 2.4 KB, under the 1 MiB floor.
-	writeBloatedEcj(t, base, ids, 3)
-
+	// 100 ids three times over: 2.4 KB, under the 1 MiB floor.
+	base, _ := erasure_coding.SeedBloatedEcVolume(t, dir, 3)
 	before, err := os.ReadFile(base + ".ecj")
 	require.NoError(t, err)
-	beforeStat, err := os.Stat(base + ".ecj")
-	require.NoError(t, err)
 
-	ev2, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
+	ev, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
 	require.NoError(t, err)
-	defer ev2.Close()
+	defer ev.Close()
 
 	after, err := os.ReadFile(base + ".ecj")
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "small journal must not be rewritten")
-	afterStat, err := os.Stat(base + ".ecj")
+}
+
+// A journal over the size floor but under the ratio is ordinary slack, not
+// bloat, and must be left alone.
+func TestEcjOverFloorUnderRatioIsNotRewritten(t *testing.T) {
+	dir := t.TempDir()
+	base := erasure_coding.EcShardFileName("", dir, 7)
+	require.NoError(t, os.WriteFile(base+".ecx", nil, 0644))
+	require.NoError(t, os.WriteFile(base+".vif", []byte{}, 0644))
+	ids := make([]types.NeedleId, 0, 50_000)
+	for id := types.NeedleId(1); id <= 50_000; id++ {
+		ids = append(ids, id)
+	}
+	// 400 KB of ids three times over: 1.2 MB on disk, 3x the set.
+	erasure_coding.WriteRepeatedEcj(t, base+".ecj", ids, 3)
+	before := ecjSize(t, base+".ecj")
+	require.Greater(t, before, int64(1<<20))
+
+	ev, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
 	require.NoError(t, err)
-	assert.Equal(t, beforeStat.Size(), afterStat.Size())
+	defer ev.Close()
+	assert.Equal(t, before, ecjSize(t, base+".ecj"), "a 3x journal is under the 4x ratio")
 }
 
 // A torn tail plus an oversized journal → repaired and compacted.
 func TestEcjTornTailAndBloatedRepairedAndCompacted(t *testing.T) {
 	dir := t.TempDir()
-
-	ids := make([]types.NeedleId, 0, 100)
-	for id := types.NeedleId(1000); id < 1100; id++ {
-		ids = append(ids, id)
-	}
-	base := erasure_coding.EcShardFileName("", dir, 7)
-	require.NoError(t, os.WriteFile(base+".ecx", nil, 0644))
-	require.NoError(t, os.WriteFile(base+".vif", []byte{}, 0644))
-	writeBloatedEcj(t, base, ids, 4096)
+	base, ids := erasure_coding.SeedBloatedEcVolume(t, dir, 4096)
 	f, err := os.OpenFile(base+".ecj", os.O_WRONLY|os.O_APPEND, 0644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte{0xAB, 0xCD, 0xEF})
@@ -203,28 +196,14 @@ func TestEcjTornTailAndBloatedRepairedAndCompacted(t *testing.T) {
 	for _, id := range ids {
 		assert.True(t, ev.IsNeedleDeleted(id), "id %d", id)
 	}
-	fi, err := os.Stat(base + ".ecj")
-	require.NoError(t, err)
-	assert.Equal(t, int64(len(ids)*types.NeedleIdSize), fi.Size())
+	assert.Equal(t, int64(len(ids)*types.NeedleIdSize), ecjSize(t, base+".ecj"))
 }
 
-// A journal in a shared index dir must not be compacted: a sibling holder may
-// have the same file open.
-func TestEcjSharedIndexDirIsNotCompacted(t *testing.T) {
-	dataDir := t.TempDir()
-	idxDir := t.TempDir()
-
-	ids := make([]types.NeedleId, 0, 100)
-	for id := types.NeedleId(1000); id < 1100; id++ {
-		ids = append(ids, id)
-	}
-	idxBase := erasure_coding.EcShardFileName("", idxDir, 7)
-	require.NoError(t, os.WriteFile(idxBase+".ecx", nil, 0644))
-	require.NoError(t, os.WriteFile(idxBase+".vif", []byte{}, 0644))
-	writeBloatedEcj(t, idxBase, ids, 4096)
-
-	before, err := os.Stat(idxBase + ".ecj")
-	require.NoError(t, err)
+// A journal in a shared index dir is compacted when this volume is its only
+// holder: nothing else has the old inode open.
+func TestEcjSharedIndexDirSoleHolderIsCompacted(t *testing.T) {
+	dataDir, idxDir := t.TempDir(), t.TempDir()
+	idxBase, ids := erasure_coding.SeedBloatedEcVolume(t, idxDir, 4096)
 
 	ev, err := erasure_coding.NewEcVolume("hdd", dataDir, idxDir, "", 7)
 	require.NoError(t, err)
@@ -233,7 +212,45 @@ func TestEcjSharedIndexDirIsNotCompacted(t *testing.T) {
 	for _, id := range ids {
 		assert.True(t, ev.IsNeedleDeleted(id), "id %d", id)
 	}
-	after, err := os.Stat(idxBase + ".ecj")
+	assert.Equal(t, int64(len(ids)*types.NeedleIdSize), ecjSize(t, idxBase+".ecj"))
+}
+
+// A journal another EcVolume already holds must not be replaced under it —
+// that holder's later deletes would land on the unlinked inode. Once it is
+// closed, the next mount compacts.
+func TestEcjHeldJournalIsNotCompacted(t *testing.T) {
+	idxDir, dataA, dataB := t.TempDir(), t.TempDir(), t.TempDir()
+	idxBase := erasure_coding.EcShardFileName("", idxDir, 7)
+	require.NoError(t, os.WriteFile(idxBase+".ecx",
+		makeNeedleMapEntry(types.NeedleId(7), types.ToOffset(8), types.Size(10)), 0644))
+	require.NoError(t, os.WriteFile(idxBase+".vif", []byte{}, 0644))
+
+	// Disk A mounts first, while the journal is still small.
+	evA, err := erasure_coding.NewEcVolume("hdd", dataA, idxDir, "", 7)
 	require.NoError(t, err)
-	assert.Equal(t, before.Size(), after.Size(), "shared journal must not be replaced")
+
+	// The journal then bloats (a peer's journal appended whole, say) and disk
+	// B mounts against the same file, as cross-disk reconcile does.
+	ids := make([]types.NeedleId, 0, 100)
+	for id := types.NeedleId(1000); id < 1100; id++ {
+		ids = append(ids, id)
+	}
+	erasure_coding.WriteRepeatedEcj(t, idxBase+".ecj", ids, 4096)
+	bloated := ecjSize(t, idxBase+".ecj")
+
+	evB, err := erasure_coding.NewEcVolume("hdd", dataB, idxDir, "", 7)
+	require.NoError(t, err)
+	assert.Equal(t, bloated, ecjSize(t, idxBase+".ecj"), "held journal must not be replaced")
+
+	// A's delete still reaches the file every later mount reads.
+	require.NoError(t, evA.DeleteNeedleFromEcx(7))
+	evA.Close()
+	evB.Close()
+
+	evC, err := erasure_coding.NewEcVolume("hdd", dataA, idxDir, "", 7)
+	require.NoError(t, err)
+	defer evC.Close()
+	assert.True(t, evC.IsNeedleDeleted(7), "a holder's delete was stranded")
+	assert.Equal(t, int64((len(ids)+1)*types.NeedleIdSize), ecjSize(t, idxBase+".ecj"),
+		"sole holder compacts")
 }

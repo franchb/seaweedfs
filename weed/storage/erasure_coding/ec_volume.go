@@ -1,12 +1,12 @@
 package erasure_coding
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -43,13 +43,14 @@ const ecjCompactMinBytes = int64(1 << 20)
 // slack is normal; an order of magnitude is not.
 const ecjCompactRatio = int64(4)
 
-// Fault-injection seams for .ecj compaction tests. Production defaults are the
-// real syscalls; tests override them to fail the rename or the reopen and
-// verify the pre/post-publication contract.
+// Fault-injection seams for the .ecj mount path. Production defaults are the
+// real calls; tests override them to fail the load, the rename, the directory
+// sync or the reopen and verify what each failure leaves behind.
 var (
-	ecjRename          = os.Rename
-	ecjOpenVolumeFile  = backend.OpenVolumeFile
-	ecjFsyncDir        = util.FsyncDir
+	ecjLoad           = (*EcVolume).loadDeletedNeedlesFromEcj
+	ecjRename         = os.Rename
+	ecjOpenVolumeFile = backend.OpenVolumeFile
+	ecjFsyncDir       = util.FsyncDir
 )
 
 type EcVolume struct {
@@ -86,6 +87,11 @@ type EcVolume struct {
 	// (seek/truncate) — the authoritative runtime delete count comes from
 	// deletedNeedles.
 	ecjFileSize int64
+
+	// ecjJournal registers this volume as a holder of its .ecj path, so a
+	// sibling EcVolume on the same file never compacts it from under us.
+	// Released by Close; guarded by ecjFileAccessLock.
+	ecjJournal *ecjJournal
 
 	// deletedNeedles is the in-memory set of needle ids that have been
 	// deleted since the volume was encoded. .ecx is immutable at runtime —
@@ -224,48 +230,11 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	ev.ecxFileSize = ecxFi.Size()
 	ev.ecxCreatedAt = ecxFi.ModTime()
 
-	// open ecj file and seed the in-memory deleted set from it.
-	if ev.ecjFile, err = backend.OpenVolumeFile(indexBaseFileName+".ecj", os.O_RDWR|os.O_CREATE); err != nil {
-		return nil, fmt.Errorf("cannot open ec volume journal %s.ecj: %v", indexBaseFileName, err)
-	}
-	if ecjFi, statErr := ev.ecjFile.Stat(); statErr == nil {
-		ev.ecjFileSize = ecjFi.Size()
-	} else {
-		glog.Warningf("stat ec volume journal %s.ecj: %v", indexBaseFileName, statErr)
-	}
-	// Truncate a torn tail before the loader runs: appends land at the
-	// physical end, so a trailing partial record would misalign every later
-	// delete and lose it on the next mount.
-	if ragged := ev.ecjFileSize % int64(types.NeedleIdSize); ragged != 0 {
-		whole := ev.ecjFileSize - ragged
-		glog.Warningf("ec volume %d: truncating torn .ecj tail %d -> %d bytes", vid, ev.ecjFileSize, whole)
-		if truncErr := ev.ecjFile.Truncate(whole); truncErr != nil {
-			return nil, fmt.Errorf("ec volume %d: repair torn .ecj tail: %w", vid, truncErr)
-		}
-		if syncErr := ev.ecjFile.Sync(); syncErr != nil {
-			return nil, fmt.Errorf("ec volume %d: sync .ecj after tail repair: %w", vid, syncErr)
-		}
-		ev.ecjFileSize = whole
-	}
-	ev.deletedNeedles = make(map[types.NeedleId]struct{})
-	if loadErr := ev.loadDeletedNeedlesFromEcj(); loadErr != nil {
-		glog.Warningf("ec volume %d: load deleted needles from .ecj: %v", vid, loadErr)
-	}
-
-	// Then fold the journal back down to the set it encodes, if the append
-	// paths have bloated it.
-	//
-	// A failure BEFORE the journal is replaced is non-fatal: nothing on disk
-	// changed and the in-memory set is already correct. A failure AFTER it is
-	// replaced is not survivable that way — maybeCompactEcj leaves ecjFile as
-	// nil in that case, and continuing would let deletes append to nothing
-	// (or an unlinked inode) while reporting success.
-	if err := ev.maybeCompactEcj(indexBaseFileName); err != nil {
-		if ev.ecjFile == nil {
-			ev.Close()
-			return nil, fmt.Errorf("ec volume %d: .ecj was compacted but could not be reopened: %w", vid, err)
-		}
-		glog.Warningf("ec volume %d: compact .ecj: %v", vid, err)
+	// Open the journal, seed the in-memory deleted set from it, and fold it
+	// back down to that set if the append paths have bloated it.
+	if err := ev.openEcj(indexBaseFileName + ".ecj"); err != nil {
+		ev.Close()
+		return nil, fmt.Errorf("ec volume %d: %w", vid, err)
 	}
 
 	// read volume info. Prefer .vif at the data dir (where shards live), but
@@ -472,7 +441,12 @@ func (ev *EcVolume) Close() {
 		_ = ev.ecjFile.Close()
 		ev.ecjFile = nil
 	}
+	journal := ev.ecjJournal
+	ev.ecjJournal = nil
 	ev.ecjFileAccessLock.Unlock()
+	if journal != nil {
+		journal.dropHolder()
+	}
 	if ev.ecxFile != nil {
 		_ = ev.ecxFile.Sync()
 		// Do NOT nil ecxFile: LocateEcShardNeedle reads it without the
@@ -515,6 +489,8 @@ func (ev *EcVolume) Destroy() {
 	for _, base := range ev.ecIndexBaseNames() {
 		os.Remove(base + ".ecx")
 		os.Remove(base + ".ecj")
+		os.Remove(base + EcjCompactTmpSuffix)
+		os.Remove(base + EcjIncomingSuffix)
 	}
 	// The .vif is shared with a coexisting normal volume (e.g. mid-decode), so
 	// only remove the active copy, not both.
@@ -710,33 +686,84 @@ func (ev *EcVolume) loadDeletedNeedlesFromEcj() error {
 	return nil
 }
 
+// openEcj opens the .ecj journal, repairs a torn tail, seeds the in-memory
+// deleted set and compacts a bloated journal, all under the journal's lock,
+// then registers this volume as one of its holders. On error the caller must
+// Close the volume, which releases whatever was opened here.
+func (ev *EcVolume) openEcj(ecjPath string) error {
+	return withEcjJournal(ecjPath, func(j *ecjJournal) error {
+		var err error
+		if ev.ecjFile, err = backend.OpenVolumeFile(ecjPath, os.O_RDWR|os.O_CREATE); err != nil {
+			return fmt.Errorf("cannot open ec volume journal %s: %w", ecjPath, err)
+		}
+		if ecjFi, statErr := ev.ecjFile.Stat(); statErr == nil {
+			ev.ecjFileSize = ecjFi.Size()
+		} else {
+			glog.Warningf("stat ec volume journal %s: %v", ecjPath, statErr)
+		}
+		// Truncate a torn tail before the loader runs: appends land at the
+		// physical end, so a trailing partial record would misalign every
+		// later delete and lose it on the next mount.
+		if ragged := ev.ecjFileSize % int64(types.NeedleIdSize); ragged != 0 {
+			whole := ev.ecjFileSize - ragged
+			glog.Warningf("ec volume %d: truncating torn .ecj tail %d -> %d bytes", ev.VolumeId, ev.ecjFileSize, whole)
+			if truncErr := ev.ecjFile.Truncate(whole); truncErr != nil {
+				return fmt.Errorf("repair torn .ecj tail: %w", truncErr)
+			}
+			if syncErr := ev.ecjFile.Sync(); syncErr != nil {
+				return fmt.Errorf("sync .ecj after tail repair: %w", syncErr)
+			}
+			ev.ecjFileSize = whole
+		}
+
+		// A compaction temp file only survives a crash before its rename, so
+		// the journal it was meant to replace is still whole. Nothing else
+		// writes this name, and we hold the journal lock.
+		if rmErr := os.Remove(ecjPath + ".compact.tmp"); rmErr == nil {
+			glog.V(0).Infof("ec volume %d: removed stale %s.compact.tmp", ev.VolumeId, ecjPath)
+		}
+
+		ev.deletedNeedles = make(map[types.NeedleId]struct{})
+		if loadErr := ecjLoad(ev); loadErr != nil {
+			// The set is partial. Serve with it, but never write it back as the
+			// whole journal: the file on disk is still complete, and the next
+			// mount gets another chance to read all of it.
+			glog.Warningf("ec volume %d: load deleted needles from .ecj: %v; skipping compaction", ev.VolumeId, loadErr)
+		} else if compactErr := ev.maybeCompactEcj(j, ecjPath); compactErr != nil {
+			// A failure that leaves no handle is fatal: continuing would let
+			// deletes append to nothing while reporting success. Any other
+			// failure left the original journal and its handle in place.
+			if ev.ecjFile == nil {
+				return fmt.Errorf(".ecj compaction left no journal handle: %w", compactErr)
+			}
+			glog.Warningf("ec volume %d: compact .ecj: %v", ev.VolumeId, compactErr)
+		}
+
+		j.addHolder()
+		ev.ecjJournal = j
+		return nil
+	})
+}
+
 // maybeCompactEcj rewrites a bloated .ecj from the set just loaded out of it.
+// Called by openEcj with the journal lock held.
 //
 // The journal is semantically a SET of deleted needle ids, but it is written
-// as an append-only log that nothing dedupes. Several paths append a peer's
-// entire journal onto this one, so a volume whose shards are repeatedly
-// balanced grows the file geometrically (observed: 1.51 TB for ~100 ids).
+// as an append-only log. Peer journals used to be appended whole onto this
+// one (MergeEcjFile now appends only the difference), so a volume whose shards
+// were repeatedly balanced grew the file geometrically (observed: 1.51 TB for
+// ~100 ids). This folds such a journal back down.
 //
 // Compaction is safe because the set IS the journal's meaning: every id in the
 // file is in the set, and no id is in the set that was not in the file (runs
-// at mount, before any runtime delete). Crash-safe via temp file + fsync +
-// rename. Mirrors Rust EcVolume::maybe_compact_ecj.
-func (ev *EcVolume) maybeCompactEcj(indexBaseFileName string) error {
-	// Only compact a journal this instance solely owns. With -dir.idx every
-	// disk resolves .ecx/.ecj to the SAME path; replacing that inode would
-	// strand a sibling holder's appends on an unlinked file.
-	if ev.ecxActualDir != ev.dir {
-		glog.V(1).Infof("ec volume %d: skipping .ecj compaction: journal may be shared with another holder", ev.VolumeId)
-		return nil
-	}
-
+// at mount, before any runtime delete, and only after a complete load).
+// Crash-safe via temp file + fsync + rename. Mirrors Rust
+// EcVolume::maybe_compact_ecj.
+func (ev *EcVolume) maybeCompactEcj(j *ecjJournal, ecjPath string) error {
 	ev.deletedNeedlesLock.RLock()
-	ids := make([]types.NeedleId, 0, len(ev.deletedNeedles))
-	for id := range ev.deletedNeedles {
-		ids = append(ids, id)
-	}
+	unique := len(ev.deletedNeedles)
 	ev.deletedNeedlesLock.RUnlock()
-	compactedLen := int64(len(ids)) * int64(types.NeedleIdSize)
+	compactedLen := int64(unique) * int64(types.NeedleIdSize)
 
 	// Leave healthy journals alone: rewriting on every mount would churn the
 	// disk for no gain.
@@ -744,81 +771,94 @@ func (ev *EcVolume) maybeCompactEcj(indexBaseFileName string) error {
 		return nil
 	}
 
+	// Replacing the inode would strand every other holder's appends on the
+	// unlinked file. The journal lock guarantees no holder registers while we
+	// run, so a count of zero is exact.
+	if j.holders > 0 {
+		glog.Warningf("ec volume %d: .ecj %s is bloated (%d bytes, %d unique ids) but %d other ec volume(s) in this process hold it open; skipping compaction until it is mounted alone",
+			ev.VolumeId, ecjPath, ev.ecjFileSize, unique, j.holders)
+		return nil
+	}
+
 	glog.Warningf("ec volume %d: compacting bloated .ecj deletion journal: %d bytes, %d unique ids -> %d bytes",
-		ev.VolumeId, ev.ecjFileSize, len(ids), compactedLen)
+		ev.VolumeId, ev.ecjFileSize, unique, compactedLen)
 
-	ecjPath := indexBaseFileName + ".ecj"
 	tmpPath := ecjPath + ".compact.tmp"
-
-	// Sorted so the rewritten file is deterministic.
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	if err := writeCompactedEcj(tmpPath, ids); err != nil {
+	if err := ev.writeCompactedEcj(tmpPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
 
 	// Drop our handle BEFORE replacing it. On Windows a rename over an open
 	// file fails; on Unix the handle would survive as an unlinked inode. From
-	// here until the reopen, ecjFile is nil on purpose: the signal NewEcVolume
-	// uses to tell "nothing was published" from "replaced with no handle".
+	// here until the reopen, ecjFile is nil on purpose: openEcj treats a
+	// failure that leaves it nil as fatal.
 	if ev.ecjFile != nil {
 		_ = ev.ecjFile.Close()
 		ev.ecjFile = nil
 	}
 
-	if err := ecjRename(tmpPath, ecjPath); err != nil {
+	if renameErr := ecjRename(tmpPath, ecjPath); renameErr != nil {
 		_ = os.Remove(tmpPath)
-		// Nothing was published — restore a working handle, non-fatal.
+		// Nothing was published: restore a handle on the original journal.
 		reopened, openErr := ecjOpenVolumeFile(ecjPath, os.O_RDWR|os.O_CREATE)
 		if openErr != nil {
-			return openErr
+			return fmt.Errorf("rename %s: %v; reopen original journal: %w", tmpPath, renameErr, openErr)
 		}
 		ev.ecjFile = reopened
 		if fi, statErr := reopened.Stat(); statErr == nil {
 			ev.ecjFileSize = fi.Size()
 		}
-		return err
+		return fmt.Errorf("rename %s: %w", tmpPath, renameErr)
 	}
 
 	// Syncing the temp file persisted its contents, not the directory entry.
 	// Post-publication, so a failure is fatal like the reopen below.
 	if err := ecjFsyncDir(filepath.Dir(ecjPath)); err != nil {
-		return err
+		return fmt.Errorf("sync directory after replacing %s: %w", ecjPath, err)
 	}
 
 	reopened, err := ecjOpenVolumeFile(ecjPath, os.O_RDWR|os.O_CREATE)
 	if err != nil {
-		return err
+		return fmt.Errorf("reopen compacted %s: %w", ecjPath, err)
 	}
-	if fi, statErr := reopened.Stat(); statErr != nil {
+	fi, err := reopened.Stat()
+	if err != nil {
 		_ = reopened.Close()
-		return statErr
-	} else {
-		ev.ecjFileSize = fi.Size()
+		return fmt.Errorf("stat compacted %s: %w", ecjPath, err)
 	}
+	ev.ecjFileSize = fi.Size()
 	ev.ecjFile = reopened
 	return nil
 }
 
-func writeCompactedEcj(tmpPath string, ids []types.NeedleId) error {
-	f, err := os.Create(tmpPath)
+// writeCompactedEcj streams the deleted set straight out of the map, one
+// record per id, so compaction needs no second copy of the set.
+func (ev *EcVolume) writeCompactedEcj(tmpPath string) error {
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
+	w := bufio.NewWriterSize(f, ecjLoadChunkBytes)
 	rec := make([]byte, types.NeedleIdSize)
-	for _, id := range ids {
+	ev.deletedNeedlesLock.RLock()
+	for id := range ev.deletedNeedles {
 		types.NeedleIdToBytes(rec, id)
-		if _, err := f.Write(rec); err != nil {
-			_ = f.Close()
-			return err
+		if _, err = w.Write(rec); err != nil {
+			break
 		}
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
+	ev.deletedNeedlesLock.RUnlock()
+	if err == nil {
+		err = w.Flush()
 	}
-	return f.Close()
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (ev *EcVolume) LocateEcShardNeedle(needleId types.NeedleId, version needle.Version) (offset types.Offset, size types.Size, intervals []Interval, err error) {

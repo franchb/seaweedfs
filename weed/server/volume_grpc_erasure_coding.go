@@ -437,8 +437,7 @@ func (vs *VolumeServer) VolumeEcShardsCopy(ctx context.Context, req *volume_serv
 		}
 
 		if req.CopyEcjFile {
-			// copy ecj file
-			if _, err := vs.doCopyFileWithThrottler(client, true, req.Collection, req.VolumeId, math.MaxUint32, math.MaxInt64, indexBaseFileName, ".ecj", true, true, nil, throttler); err != nil {
+			if err := vs.mergeEcjFileFromPeer(client, req.Collection, req.VolumeId, indexBaseFileName, throttler); err != nil {
 				return err
 			}
 		}
@@ -679,13 +678,13 @@ func removeEcSharedIndexFiles(bName string, location *storage.DiskLocation, hasE
 	dataBaseFilename := path.Join(location.Directory, bName)
 	if hasEcxFile {
 		// .ecx/.ecj may be in either dir depending on when -dir.idx was configured.
-		for _, p := range []string{indexBaseFilename + ".ecx", indexBaseFilename + ".ecj"} {
+		for _, p := range []string{indexBaseFilename + ".ecx", indexBaseFilename + ".ecj", indexBaseFilename + erasure_coding.EcjCompactTmpSuffix, indexBaseFilename + erasure_coding.EcjIncomingSuffix} {
 			if err := removeFileIfExists(p); err != nil {
 				return err
 			}
 		}
 		if location.IdxDirectory != location.Directory {
-			for _, p := range []string{dataBaseFilename + ".ecx", dataBaseFilename + ".ecj"} {
+			for _, p := range []string{dataBaseFilename + ".ecx", dataBaseFilename + ".ecj", dataBaseFilename + erasure_coding.EcjCompactTmpSuffix, dataBaseFilename + erasure_coding.EcjIncomingSuffix} {
 				if err := removeFileIfExists(p); err != nil {
 					return err
 				}

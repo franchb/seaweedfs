@@ -461,12 +461,24 @@ impl DiskLocation {
         const MAX_SHARD_COUNT: usize = 32;
 
         // Remove index files from idx directory (.ecx, .ecj)
-        rm_if_present(format!("{}.ecx", idx_base))?;
-        rm_if_present(format!("{}.ecj", idx_base))?;
+        let rm_journal = |b: &str| -> io::Result<()> {
+            rm_if_present(format!("{}.ecx", b))?;
+            rm_if_present(format!("{}.ecj", b))?;
+            rm_if_present(format!(
+                "{}{}",
+                b,
+                crate::storage::erasure_coding::ecj_journal::ECJ_COMPACT_TMP_SUFFIX
+            ))?;
+            rm_if_present(format!(
+                "{}{}",
+                b,
+                crate::storage::erasure_coding::ecj_journal::ECJ_INCOMING_SUFFIX
+            ))
+        };
+        rm_journal(&idx_base)?;
         // Also try data directory in case .ecx/.ecj were created before -dir.idx was configured
         if self.idx_directory != self.directory {
-            rm_if_present(format!("{}.ecx", base))?;
-            rm_if_present(format!("{}.ecj", base))?;
+            rm_journal(&base)?;
         }
 
         // Remove all EC shard files (.ec00 ~ .ec31)

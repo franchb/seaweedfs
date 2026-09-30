@@ -639,10 +639,14 @@ func (l *DiskLocation) removeEcVolumeFiles(collection string, vid needle.VolumeI
 	// EC loading for incomplete/missing shards on next startup
 	removeFile(indexBaseFileName+".ecx", "EC index file")
 	removeFile(indexBaseFileName+".ecj", "EC journal file")
+	removeFile(indexBaseFileName+erasure_coding.EcjCompactTmpSuffix, "EC journal compaction temp file")
+	removeFile(indexBaseFileName+erasure_coding.EcjIncomingSuffix, "EC journal staging file")
 	// Also try the data directory in case .ecx/.ecj were created before -dir.idx was configured
 	if l.IdxDirectory != l.Directory {
 		removeFile(baseFileName+".ecx", "EC index file (fallback)")
 		removeFile(baseFileName+".ecj", "EC journal file (fallback)")
+		removeFile(baseFileName+erasure_coding.EcjCompactTmpSuffix, "EC journal compaction temp file (fallback)")
+		removeFile(baseFileName+erasure_coding.EcjIncomingSuffix, "EC journal staging file (fallback)")
 	}
 
 	// Remove all EC shard files (.ec00 ~ .ec31) from data directory

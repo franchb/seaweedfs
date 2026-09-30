@@ -1733,15 +1733,33 @@ async fn fetch_ec_index_from_one_peer(
         )));
     }
 
-    // .ecj is the source peer's deletion journal (appended); .vif carries EC
-    // params. Both are best-effort: a missing .ecj is recreated at mount and a
-    // missing .vif falls back to default EC parameters. A failed .ecj append
-    // leaves a partial file, so drop it.
+    // .ecj is the source peer's deletion journal; .vif carries EC params. Both
+    // are best-effort: a missing .ecj is recreated at mount and a missing .vif
+    // falls back to default EC parameters. The .ecj is staged and merged into
+    // any local journal as a set union, so a failed copy leaves the local one
+    // untouched.
     match client.copy_file(copy_req(".ecj", true)).await {
         Ok(resp) => {
-            if let Err(e) = drain_copy_stream(resp.into_inner(), ecj_path, true).await {
+            let staged = format!(
+                "{}{}",
+                ecj_path.trim_end_matches(".ecj"),
+                crate::storage::erasure_coding::ecj_journal::ECJ_INCOMING_SUFFIX
+            );
+            let merged = match drain_copy_stream(resp.into_inner(), &staged, false).await {
+                Ok(()) => {
+                    let (ecj, staged) = (ecj_path.to_string(), staged.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::storage::erasure_coding::ecj_journal::merge_ecj_file(&ecj, &staged)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(io::Error::other(e)))
+                    .map(|_| ())
+                }
+                Err(e) => Err(e),
+            };
+            let _ = fs::remove_file(&staged);
+            if let Err(e) = merged {
                 tracing::warn!(volume_id = m.vid.0, peer = %peer, "copy .ecj: {}", e);
-                let _ = fs::remove_file(ecj_path);
             }
         }
         Err(e) => tracing::warn!(volume_id = m.vid.0, peer = %peer, "copy .ecj: {}", e),
