@@ -578,9 +578,15 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				TtlSec:           lifecycleTTLSec,
 			})
 			if err != nil {
+				if isReadOnlyAssignError(err) {
+					return fmt.Errorf("assign volume: %w: %v", weed_server.ErrReadOnly, err)
+				}
 				return fmt.Errorf("assign volume: %w", err)
 			}
 			if resp.Error != "" {
+				if strings.Contains(resp.Error, weed_server.ErrReadOnly.Error()) {
+					return fmt.Errorf("assign volume: %w: %s", weed_server.ErrReadOnly, resp.Error)
+				}
 				return fmt.Errorf("assign volume: %v", resp.Error)
 			}
 			assignResult = resp
@@ -1487,8 +1493,26 @@ func filerErrorToS3Error(err error) s3err.ErrorCode {
 // added later that does — a request budget, an auth deadline, shutdown draining —
 // would have to cancel with its own cause and be excluded here, otherwise a body
 // truncated at that instant gets attributed to the peer.
+// isReadOnlyAssignError reports whether an AssignVolume gRPC transport error
+// carries the filer's read-only (e.g. bucket over quota) condition. New filers
+// return codes.FailedPrecondition; the message check keeps old string clients working.
+func isReadOnlyAssignError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, weed_server.ErrReadOnly) {
+		return true
+	}
+	if status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), weed_server.ErrReadOnly.Error()) {
+		return true
+	}
+	return false
+}
+
 func mapChunkedUploadErrorToS3Error(reqCtx context.Context, err error) s3err.ErrorCode {
 	switch {
+	case errors.Is(err, weed_server.ErrReadOnly):
+		return s3err.ErrAccessDenied
 	case strings.Contains(err.Error(), s3err.ErrMsgPayloadChecksumMismatch):
 		return s3err.ErrInvalidDigest
 	case errors.Is(err, operation.ErrTruncatedBody):
@@ -1497,6 +1521,11 @@ func mapChunkedUploadErrorToS3Error(reqCtx context.Context, err error) s3err.Err
 		}
 		return s3err.ErrIncompleteBody
 	default:
+		// Backward compat with filers that still return read-only as a
+		// free-text AssignVolumeResponse.Error string.
+		if err != nil && strings.Contains(err.Error(), weed_server.ErrReadOnly.Error()) {
+			return s3err.ErrAccessDenied
+		}
 		return s3err.ErrInternalError
 	}
 }

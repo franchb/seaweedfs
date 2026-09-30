@@ -909,6 +909,12 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 	so, err := fs.resolveAssignStorageOption(ctx, req)
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "AssignVolume: %v", err)
+		if errors.Is(err, ErrReadOnly) {
+			// Carry read-only across the gRPC boundary as a status code so
+			// S3 callers can map it via errors.Is instead of falling to 500.
+			// The message keeps the ErrReadOnly text for old string-match clients.
+			return nil, status.Errorf(codes.FailedPrecondition, "assign volume: %v", err)
+		}
 		return &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume: %v", err)}, nil
 	}
 

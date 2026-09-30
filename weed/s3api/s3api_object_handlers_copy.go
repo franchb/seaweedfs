@@ -24,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/security"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc/codes"
@@ -1438,9 +1439,18 @@ func (s3a *S3ApiServer) assignNewVolume(dstPath string, expectedDataSize uint64)
 			ExpectedDataSize: expectedDataSize,
 		})
 		if err != nil {
+			if status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), weed_server.ErrReadOnly.Error()) {
+				return fmt.Errorf("assign volume: %w: %v", weed_server.ErrReadOnly, err)
+			}
+			if strings.Contains(err.Error(), weed_server.ErrReadOnly.Error()) {
+				return fmt.Errorf("assign volume: %w: %v", weed_server.ErrReadOnly, err)
+			}
 			return fmt.Errorf("assign volume: %w", err)
 		}
 		if resp.Error != "" {
+			if strings.Contains(resp.Error, weed_server.ErrReadOnly.Error()) {
+				return fmt.Errorf("assign volume: %w: %s", weed_server.ErrReadOnly, resp.Error)
+			}
 			return fmt.Errorf("assign volume: %v", resp.Error)
 		}
 		assignResult = resp
