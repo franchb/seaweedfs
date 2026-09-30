@@ -2,13 +2,12 @@ package weed_server
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 func newAssignTestServer(fc *filer.FilerConf, diskType string) *FilerServer {
@@ -65,7 +64,9 @@ func TestResolveAssignStorageOptionFallsBackToFilerDiskDefault(t *testing.T) {
 	}
 }
 
-func TestAssignVolumeReadOnlyReturnsFailedPrecondition(t *testing.T) {
+// A read-only path is a verdict, not a transport failure: it must come back as a
+// successful RPC (so clients neither retry nor fail over) carrying READ_ONLY.
+func TestAssignVolumeReadOnlyReturnsErrorCode(t *testing.T) {
 	fc := filer.NewFilerConf()
 	if err := fc.SetLocationConf(&filer_pb.FilerConf_PathConf{
 		LocationPrefix: "/buckets/overquota",
@@ -76,16 +77,20 @@ func TestAssignVolumeReadOnlyReturnsFailedPrecondition(t *testing.T) {
 
 	fs := newAssignTestServer(fc, "")
 
-	_, err := fs.AssignVolume(context.Background(), &filer_pb.AssignVolumeRequest{
+	resp, err := fs.AssignVolume(context.Background(), &filer_pb.AssignVolumeRequest{
 		Path: "/buckets/overquota/x",
 	})
-	if err == nil {
-		t.Fatal("AssignVolume err = nil, want FailedPrecondition")
+	if err != nil {
+		t.Fatalf("AssignVolume err = %v, want a response", err)
 	}
-	if got := status.Code(err); got != codes.FailedPrecondition {
-		t.Fatalf("AssignVolume code = %v, want %v", got, codes.FailedPrecondition)
+	if resp.ErrorCode != filer_pb.FilerError_READ_ONLY {
+		t.Fatalf("AssignVolume error_code = %v, want %v", resp.ErrorCode, filer_pb.FilerError_READ_ONLY)
 	}
-	if !strings.Contains(err.Error(), ErrReadOnly.Error()) {
-		t.Fatalf("AssignVolume err = %v, want it to carry %q", err, ErrReadOnly.Error())
+	// Clients that predate error_code still get the old message.
+	if want := "assign volume: read only: /buckets/overquota"; !strings.HasPrefix(resp.Error, want) {
+		t.Fatalf("AssignVolume error = %q, want prefix %q", resp.Error, want)
+	}
+	if err := filer_pb.AssignVolumeResponseError(resp); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("AssignVolumeResponseError = %v, want ErrReadOnly", err)
 	}
 }

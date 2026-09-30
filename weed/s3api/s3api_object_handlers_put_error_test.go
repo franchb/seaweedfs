@@ -9,10 +9,8 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
-	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 func TestMapChunkedUploadErrorToS3Error(t *testing.T) {
@@ -46,22 +44,20 @@ func TestMapChunkedUploadErrorToS3Error(t *testing.T) {
 			want: s3err.ErrInternalError,
 		},
 		{
-			// Over-quota (read-only) buckets must be 403, not retryable 500.
-			// See franchb/seaweedfs#12: ErrReadOnly was lost at the filer
-			// AssignVolume gRPC boundary.
-			name: "wrapped read-only maps to AccessDenied",
-			err:  fmt.Errorf("assign volume: %w: read only: /buckets/q (e.g. bucket over quota)", weed_server.ErrReadOnly),
+			// Over-quota (read-only) buckets must be 403, not retryable 500 (#12).
+			name: "filer read-only verdict maps to AccessDenied",
+			err: fmt.Errorf("upload chunk: assign volume: %w", filer_pb.AssignVolumeResponseError(&filer_pb.AssignVolumeResponse{
+				Error:     "assign volume: read only: /buckets/q (e.g. bucket over quota)",
+				ErrorCode: filer_pb.FilerError_READ_ONLY,
+			})),
 			want: s3err.ErrAccessDenied,
 		},
 		{
-			name: "old filer free-text read-only maps to AccessDenied",
-			err:  errors.New("assign volume: assign volume: read only: /buckets/q (e.g. bucket over quota)"),
-			want: s3err.ErrAccessDenied,
-		},
-		{
-			name: "gRPC FailedPrecondition read-only maps to AccessDenied",
-			err:  status.Errorf(codes.FailedPrecondition, "assign volume: read only: /buckets/q (e.g. bucket over quota)"),
-			want: s3err.ErrAccessDenied,
+			// A full volume rejecting a write is a transient server fault the
+			// client should retry, even though its text also says "read only".
+			name: "volume server read-only write stays InternalError",
+			err:  errors.New("upload chunk: upload data: unexpected status 500: volume 5 is read only"),
+			want: s3err.ErrInternalError,
 		},
 	}
 	for _, tt := range tests {
@@ -125,29 +121,6 @@ func TestMapChunkedUploadErrorToS3ErrorClientDisconnect(t *testing.T) {
 				t.Errorf("mapChunkedUploadErrorToS3Error() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestIsReadOnlyAssignError(t *testing.T) {
-	readOnlyStatus := status.Errorf(codes.FailedPrecondition, "assign volume: %v", weed_server.ErrReadOnly)
-	wrapped := fmt.Errorf("assign volume: %w: %v", weed_server.ErrReadOnly, readOnlyStatus)
-	otherStatus := status.Errorf(codes.Unavailable, "filer down")
-	plain := errors.New("assign volume: no free volumes")
-
-	if !isReadOnlyAssignError(readOnlyStatus) {
-		t.Error("FailedPrecondition read-only status should match")
-	}
-	if !isReadOnlyAssignError(wrapped) {
-		t.Error("wrapped ErrReadOnly should match")
-	}
-	if isReadOnlyAssignError(otherStatus) {
-		t.Error("Unavailable should not match as read-only")
-	}
-	if isReadOnlyAssignError(plain) {
-		t.Error("generic assign error should not match as read-only")
-	}
-	if isReadOnlyAssignError(nil) {
-		t.Error("nil should not match as read-only")
 	}
 }
 
