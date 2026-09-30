@@ -3,6 +3,7 @@ package erasure_coding_test
 import (
 	"os"
 	"testing"
+	"time"
 
 	erasure_coding "github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -137,10 +138,20 @@ func TestEcjHealthySmallJournalNotRewritten(t *testing.T) {
 	// Duplicated 3x, but only 2.4 KB — under ecjCompactMinBytes.
 	ecj := append(append(ecjBytes(ids...), ecjBytes(ids...)...), ecjBytes(ids...)...)
 
-	ev, base := mountEcVolume(t, dir, nil, ecj)
+	// Lay the files down and take the baseline BEFORE mounting, so a rewrite
+	// during the mount shows up as a difference. The mtime is pushed into the
+	// past so a rewrite within the filesystem's timestamp granularity still
+	// changes it.
+	base := erasure_coding.EcShardFileName("", dir, 7)
+	require.NoError(t, os.WriteFile(base+".ecx", nil, 0644))
+	require.NoError(t, os.WriteFile(base+".ecj", ecj, 0644))
+	require.NoError(t, os.WriteFile(base+".vif", []byte{}, 0644))
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(base+".ecj", past, past))
 	before, err := os.ReadFile(base + ".ecj")
 	require.NoError(t, err)
-	beforeFi, err := os.Stat(base + ".ecj")
+
+	ev, err := erasure_coding.NewEcVolume("hdd", dir, dir, "", 7)
 	require.NoError(t, err)
 	for _, id := range ids {
 		assert.True(t, ev.IsNeedleDeleted(id), "id %d", id)
@@ -152,5 +163,5 @@ func TestEcjHealthySmallJournalNotRewritten(t *testing.T) {
 	assert.Equal(t, before, after, "small journal must not be rewritten")
 	afterFi, err := os.Stat(base + ".ecj")
 	require.NoError(t, err)
-	assert.Equal(t, beforeFi.Size(), afterFi.Size())
+	assert.True(t, afterFi.ModTime().Equal(past), "small journal mtime must be unchanged, got %v", afterFi.ModTime())
 }
