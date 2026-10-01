@@ -17,7 +17,7 @@ use crate::pb::master_pb;
 use crate::pb::volume_server_pb;
 use crate::pb::volume_server_pb::volume_server_server::VolumeServer;
 use crate::storage::erasure_coding::ec_shard::{DATA_SHARDS_COUNT, ShardId, shard_id_try_from};
-use crate::storage::erasure_coding::ecj_merge::{merge_ecj_union, read_ecj_ids};
+use crate::storage::erasure_coding::ecj_merge::EcjIdDecoder;
 use crate::storage::needle::needle::{self, Needle};
 use crate::storage::types::*;
 use crate::storage::volume::VolumeSpec;
@@ -3228,11 +3228,10 @@ impl VolumeServer for VolumeGrpcService {
             }
         }
 
-        // Copy .ecj file if requested
-        // The journal is a *set* of ids: the destination must end up as the
-        // deduplicated union (local ∪ source), not the concatenation. Stream
-        // the source into a temp sibling, then merge + atomic rename (#13).
-        // A missing source is not an error (ignore_source_file_not_found).
+        // Copy .ecj file if requested. The journal is a *set* of ids: merge
+        // the source's into the local one as a union, never append it whole,
+        // or every balance round trip doubles it (#13). A source without one
+        // is not an error.
         if req.copy_ecj_file {
             let copy_req = volume_server_pb::CopyFileRequest {
                 volume_id: req.volume_id,
@@ -3254,22 +3253,25 @@ impl VolumeServer for VolumeGrpcService {
                     ))
                 })?
                 .into_inner();
-
-            let file_path = {
-                let base =
-                    crate::storage::volume::volume_file_name(&dest_idx_dir, &req.collection, vid);
-                format!("{}.ecj", base)
-            };
-            let incoming_path = format!("{}.incoming", file_path);
-            let (written, modified_ts_ns) =
-                drain_ecj_copy_stream_to_temp(&mut stream, &incoming_path, ".ecj").await?;
-            if modified_ts_ns == 0 && written == 0 {
-                // Source has no .ecj: leave the destination (and any mount)
-                // untouched.
-                let _ = tokio::fs::remove_file(&incoming_path).await;
-            } else {
-                commit_merged_ecj(&file_path, &incoming_path, vid, &self.state, "VolumeEcShardsCopy")
-                    .await?;
+            let (ids, found) = receive_ecj_ids(&mut stream).await.map_err(|e| {
+                Status::internal(format!(
+                    "VolumeEcShardsCopy volume {} copy .ecj: {}",
+                    vid, e
+                ))
+            })?;
+            if found {
+                let ecj_path = format!(
+                    "{}.ecj",
+                    crate::storage::volume::volume_file_name(&dest_idx_dir, &req.collection, vid)
+                );
+                merge_ecj_ids(&self.state, vid, ecj_path, ids)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "VolumeEcShardsCopy volume {} merge .ecj: {}",
+                            vid, e
+                        ))
+                    })?;
             }
         }
 
@@ -5904,86 +5906,41 @@ async fn drain_copy_stream_to_file(
     }
 }
 
-/// Drain a CopyFile stream for `.ecj` into a temp sibling, tracking the
-/// source's `modified_ts_ns` so a missing source (empty stream, ts 0) can be
-/// told apart from a genuinely empty journal (empty content, ts != 0).
-/// Returns `(bytes_written, modified_ts_ns)`.
-async fn drain_ecj_copy_stream_to_temp(
+/// Decode a CopyFile stream of an `.ecj` into its distinct ids without staging
+/// it on disk. `found` is false only when the source has no journal, which it
+/// signals with neither a modified time nor any bytes; an empty journal still
+/// carries its modified time.
+pub(crate) async fn receive_ecj_ids(
     stream: &mut tonic::Streaming<volume_server_pb::CopyFileResponse>,
-    temp_path: &str,
-    what: &str,
-) -> Result<(u64, i64), Status> {
-    use tokio::io::AsyncWriteExt;
-    let file = tokio::fs::File::create(temp_path)
+) -> std::io::Result<(std::collections::HashSet<NeedleId>, bool)> {
+    let mut decoder = EcjIdDecoder::default();
+    let mut found = false;
+    while let Some(chunk) = stream
+        .message()
         .await
-        .map_err(|e| Status::internal(format!("create {}: {}", temp_path, e)))?;
-    let mut writer = tokio::io::BufWriter::new(file);
-    let write_all = async {
-        let mut written: u64 = 0;
-        let mut modified_ts_ns: i64 = 0;
-        while let Some(chunk) = stream
-            .message()
-            .await
-            .map_err(|e| Status::internal(format!("recv {}: {}", what, e)))?
-        {
-            if chunk.modified_ts_ns != 0 {
-                modified_ts_ns = chunk.modified_ts_ns;
-            }
-            writer
-                .write_all(&chunk.file_content)
-                .await
-                .map_err(|e| Status::internal(format!("write {}: {}", temp_path, e)))?;
-            written += chunk.file_content.len() as u64;
-        }
-        writer
-            .flush()
-            .await
-            .map_err(|e| Status::internal(format!("flush {}: {}", temp_path, e)))?;
-        Ok::<(u64, i64), Status>((written, modified_ts_ns))
-    };
-    match write_all.await {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            drop(writer);
-            let _ = tokio::fs::remove_file(temp_path).await;
-            Err(e)
-        }
+        .map_err(|e| std::io::Error::other(format!("recv .ecj: {}", e)))?
+    {
+        found |= chunk.modified_ts_ns != 0 || !chunk.file_content.is_empty();
+        decoder.push(&chunk.file_content);
     }
+    Ok((decoder.into_ids(), found))
 }
 
-/// Merge a staged `.ecj` (`incoming_path`) with the local journal at
-/// `file_path` as a deduped union, then adopt the result into any mounted
-/// volume owning `file_path`. Shared by the copy and recovery paths so the
-/// set-union rule and the handle-reopen rule stay identical.
-async fn commit_merged_ecj(
-    file_path: &str,
-    incoming_path: &str,
+/// Merge received `.ecj` ids into vid's local journal at `ecj_path` off the
+/// async runtime (the merge reads, appends and fsyncs). Shared by shard copy
+/// and index recovery.
+pub(crate) async fn merge_ecj_ids(
+    state: &std::sync::Arc<super::volume_server::VolumeServerState>,
     vid: VolumeId,
-    state: &super::volume_server::VolumeServerState,
-    op: &str,
-) -> Result<(), Status> {
-    let merge_result = tokio::task::spawn_blocking({
-        let file_path = file_path.to_string();
-        let incoming_path = incoming_path.to_string();
-        move || merge_ecj_union(&file_path, &incoming_path, &file_path)
+    ecj_path: String,
+    ids: std::collections::HashSet<NeedleId>,
+) -> std::io::Result<usize> {
+    let state = std::sync::Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        crate::storage::store_ec_journal::merge_ec_journal(&state.store, vid, &ecj_path, &ids)
     })
     .await
-    .map_err(|e| Status::internal(format!("{} volume {} join .ecj: {}", op, vid, e)))?;
-    let _ = std::fs::remove_file(incoming_path);
-    merge_result.map_err(|e| {
-        Status::internal(format!("{} volume {} merge .ecj {}: {}", op, vid, file_path, e))
-    })?;
-    // If the volume is mounted, the in-memory set + open handle must follow
-    // the replaced file, or later deletes go to an unlinked inode.
-    let merged_ids = read_ecj_ids(file_path)
-        .map_err(|e| Status::internal(format!("{} volume {} read merged .ecj {}: {}", op, vid, file_path, e)))?;
-    let mut store = state.store.write().unwrap();
-    for ecv in store.find_all_ec_volumes_mut(vid) {
-        if ecv.ecj_file_name() == file_path && let Err(e) = ecv.adopt_merged_ecj(&merged_ids) {
-            tracing::warn!(volume_id = vid.0, error = %e, "{} adopt merged .ecj", op);
-        }
-    }
-    Ok(())
+    .map_err(|e| std::io::Error::other(format!("join .ecj merge: {}", e)))?
 }
 
 /// One file of a volume copy: what to ask the source for and where it lands.

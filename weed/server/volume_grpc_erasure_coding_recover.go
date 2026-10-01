@@ -146,9 +146,9 @@ func (vs *VolumeServer) fetchEcIndexFromPeers(peers []pb.ServerAddress, m storag
 			// .ecj is the source peer's deletion journal; .vif carries EC params
 			// and EncodeTsNs. Both are best-effort: a missing .ecj is recreated at
 			// mount and a missing .vif falls back to default EC parameters. The
-			// journal is a *set*: merge as a deduped union (#13) so a bounced
-			// volume cannot double it. Failures keep the local journal intact;
-			// the .vif copy stages and renames, leaving nothing to clean up.
+			// journal is a *set*: merge it as a union (#13) so a bounced volume
+			// cannot double it. The merge only appends whole records, and the
+			// .vif copy stages and renames, so a failure leaves nothing to clean.
 			if err := vs.copyEcjAndMerge(client, m.Collection, uint32(m.VolumeId), idxBaseFileName, util.NewWriteThrottler(vs.maintenanceBytePerSecond)); err != nil {
 				glog.Warningf("ec volume %d: copy .ecj from %s: %v", m.VolumeId, peer, err)
 			}
